@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +17,15 @@ import (
 
 const (
 	timeout        = 3 * time.Second
-	maxConcurrency = 50
+	maxConcurrency = 80
+	maxOutputLimit = 300 // Максимальное количество итоговых конфигов
 )
+
+type ConfigResult struct {
+	URL     string
+	Latency time.Duration
+	Score   int
+}
 
 func main() {
 	sources, err := readLines("sources.txt")
@@ -26,7 +34,7 @@ func main() {
 		return
 	}
 
-	rawConfigs := make(chan string, 5000)
+	rawConfigs := make(chan string, 10000)
 	var wg sync.WaitGroup
 
 	// 1. Скачиваем подписки
@@ -55,10 +63,10 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Собрано %d уникальных конфигов. Начинаем проверку доступности...\n", len(uniqueConfigs))
+	fmt.Printf("Собрано %d уникальных конфигов. Начинаем глубокое тестирование...\n", len(uniqueConfigs))
 
-	// 3. Проверка TCP/Latency
-	validConfigs := make(chan string, len(uniqueConfigs))
+	// 3. Проверка Latency и расчет рейтинга (Score)
+	resultsChan := make(chan ConfigResult, len(uniqueConfigs))
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
 
@@ -69,23 +77,41 @@ func main() {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			if checkPing(c) {
-				validConfigs <- c
+			if res, ok := testConfig(c); ok {
+				resultsChan <- res
 			}
 		}(cfg)
 	}
 
 	testWg.Wait()
-	close(validConfigs)
+	close(resultsChan)
 
-	// 4. Сохранение результатов
-	var finalSlice []string
-	for v := range validConfigs {
-		finalSlice = append(finalSlice, v)
+	// 4. Сбор результатов
+	var validResults []ConfigResult
+	for res := range resultsChan {
+		validResults = append(validResults, res)
 	}
 
-	fmt.Printf("Прошло проверку: %d конфигов.\n", len(finalSlice))
+	fmt.Printf("Успешно ответили: %d конфигов.\n", len(validResults))
 
+	// 5. Сортировка по очкам (чем больше Score, тем выше в списке)
+	sort.Slice(validResults, func(i, j int) bool {
+		return validResults[i].Score > validResults[j].Score
+	})
+
+	// 6. Ограничиваем топом из 300 самых лучших
+	if len(validResults) > maxOutputLimit {
+		validResults = validResults[:maxOutputLimit]
+	}
+
+	var finalSlice []string
+	for _, r := range validResults {
+		finalSlice = append(finalSlice, r.URL)
+	}
+
+	fmt.Printf("Отобрано ТОП-%d лучших конфигов.\n", len(finalSlice))
+
+	// 7. Сохранение результатов
 	rawOutput := strings.Join(finalSlice, "\n")
 	os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
@@ -109,7 +135,6 @@ func fetchSubscription(targetURL string, out chan<- string) {
 	}
 
 	content := string(body)
-	// Пробуем декодировать из Base64, если подписка полностью зашифрована
 	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(content)); err == nil {
 		content = string(decoded)
 	}
@@ -133,18 +158,62 @@ func isProxyProtocol(line string) bool {
 	return false
 }
 
-func checkPing(configStr string) bool {
+func testConfig(configStr string) (ConfigResult, bool) {
 	host, port := parseHostPort(configStr)
 	if host == "" || port == "" {
-		return false
+		return ConfigResult{}, false
 	}
 
+	start := time.Now()
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
 	if err != nil {
-		return false
+		return ConfigResult{}, false
 	}
+	latency := time.Since(start)
 	conn.Close()
-	return true
+
+	// Оценка стойкости к блокировкам ТСПУ
+	score := calculateBypassScore(configStr, latency)
+
+	return ConfigResult{
+		URL:     configStr,
+		Latency: latency,
+		Score:   score,
+	}, true
+}
+
+func calculateBypassScore(configStr string, latency time.Duration) int {
+	score := 0
+	lower := strings.ToLower(configStr)
+
+	// 1. Приоритет протоколов и маскировки
+	if strings.HasPrefix(lower, "vless://") {
+		score += 70
+		if strings.Contains(lower, "security=reality") {
+			score += 50 // REALITY — лидер по обходу ТСПУ/белых списков
+		} else if strings.Contains(lower, "security=tls") {
+			score += 20
+		}
+		if strings.Contains(lower, "type=grpc") || strings.Contains(lower, "type=ws") {
+			score += 15 // gRPC и WebSocket лучше маскируются под обычный веб-трафик
+		}
+	} else if strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://") {
+		score += 90 // Hysteria2 — отличный протокол для сложных условий и плохих сетей
+	} else if strings.HasPrefix(lower, "tuic://") {
+		score += 80
+	} else if strings.HasPrefix(lower, "trojan://") {
+		score += 40
+	} else if strings.HasPrefix(lower, "vmess://") {
+		score += 30
+	} else {
+		score += 10
+	}
+
+	// 2. Учитываем пинг (чем меньше пинг в мс, тем выше балл)
+	pingMs := int(latency.Milliseconds())
+	score -= pingMs / 10 // Каждые 10 мс пинга отнимают 1 очко
+
+	return score
 }
 
 func parseHostPort(configStr string) (string, string) {
