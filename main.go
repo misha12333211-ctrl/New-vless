@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	timeout        = 3 * time.Second
-	maxConcurrency = 80
+	timeout        = 4 * time.Second
+	maxConcurrency = 60
 	maxOutputLimit = 300
 )
 
@@ -28,16 +28,18 @@ type ConfigResult struct {
 	Score   int
 }
 
-// Список доменов/SNI, которые заведомо заблокированы ТСПУ (снижают балл)
+// Заведомо заблокированные ТСПУ SNI / Домены (Сразу отбрасываем)
 var blockedSNIs = []string{
 	"instagram.com", "facebook.com", "twitter.com", "x.com",
-	"ytimg.com", "ggpht.com", "googlevideo.com",
+	"ytimg.com", "ggpht.com", "googlevideo.com", "notion.so",
+	"t.me", "telegram.org",
 }
 
-// Популярные CDN / белые SNI (повышают балл)
+// Доверенные CDN / Белые SNI для обхода строгой фильтрации
 var trustedSNIs = []string{
 	"cloudflare.com", "microsoft.com", "apple.com", "amazon.com",
 	"yahoo.com", "zoom.us", "deb.debian.org", "cdn.jsdelivr.net",
+	"yandex.ru", "vk.com", "sberbank.ru", "vk.me",
 }
 
 func main() {
@@ -74,7 +76,7 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Собрано %d уникальных конфигов. Начинаем глубокое TLS/SNI тестирование...\n", len(uniqueConfigs))
+	fmt.Printf("Собрано %d уникальных конфигов. Начинаем глубокий HTTP/TLS/SNI тест...\n", len(uniqueConfigs))
 
 	resultsChan := make(chan ConfigResult, len(uniqueConfigs))
 	semaphore := make(chan struct{}, maxConcurrency)
@@ -98,11 +100,14 @@ func main() {
 
 	var validResults []ConfigResult
 	for res := range resultsChan {
-		validResults = append(validResults, res)
+		if res.Score > -1000 { // Отфильтровываем забракованные
+			validResults = append(validResults, res)
+		}
 	}
 
-	fmt.Printf("Прошли проверку (TCP + TLS Handshake): %d конфигов.\n", len(validResults))
+	fmt.Printf("Прошли строгую валидацию: %d конфигов.\n", len(validResults))
 
+	// Сортировка по итоговым очкам
 	sort.Slice(validResults, func(i, j int) bool {
 		return validResults[i].Score > validResults[j].Score
 	})
@@ -116,7 +121,7 @@ func main() {
 		finalSlice = append(finalSlice, r.URL)
 	}
 
-	fmt.Printf("Отобрано ТОП-%d лучших конфигов.\n", len(finalSlice))
+	fmt.Printf("Сформирован ТОП-%d максимальной пробиваемости.\n", len(finalSlice))
 
 	rawOutput := strings.Join(finalSlice, "\n")
 	os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
@@ -124,7 +129,7 @@ func main() {
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
-	fmt.Println("Файлы output_raw.txt и output_base64.txt успешно сформированы.")
+	fmt.Println("Файлы output_raw.txt и output_base64.txt успешно обновлены.")
 }
 
 func fetchSubscription(targetURL string, out chan<- string) {
@@ -165,49 +170,79 @@ func isProxyProtocol(line string) bool {
 }
 
 func testConfig(configStr string) (ConfigResult, bool) {
-	host, port, sni := parseConfigDetails(configStr)
+	host, port, sni, path, transport := parseConfigDetails(configStr)
 	if host == "" || port == "" {
+		return ConfigResult{}, false
+	}
+
+	// Предварительная проверка SNI: выкидываем заблокированные домены
+	if isBlockedSNI(sni) {
 		return ConfigResult{}, false
 	}
 
 	targetAddr := net.JoinHostPort(host, port)
 	start := time.Now()
 
-	// 1. Проверка базового TCP подключения
+	// 1. TCP Dial
 	rawConn, err := net.DialTimeout("tcp", targetAddr, timeout)
 	if err != nil {
 		return ConfigResult{}, false
 	}
 
-	// 2. Выполняем реальный TLS Handshake, если прокси использует TLS/Reality
 	serverName := sni
 	if serverName == "" {
 		serverName = host
 	}
 
-	tlsConfig := &tls.Config{
-		ServerName:         serverName,
-		InsecureSkipVerify: true, // Игнорируем самоподписанные/Reality сертификаты
+	var conn net.Conn = rawConn
+	isTLS := strings.Contains(configStr, "security=tls") || strings.Contains(configStr, "security=reality") || strings.HasPrefix(configStr, "trojan://")
+
+	// 2. TLS / REALITY Handshake Test
+	if isTLS {
+		tlsConfig := &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: true,
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		tlsConn.SetDeadline(time.Now().Add(timeout))
+
+		if err := tlsConn.Handshake(); err != nil {
+			_ = rawConn.Close()
+			return ConfigResult{}, false
+		}
+		conn = tlsConn
 	}
 
-	tlsConn := tls.Client(rawConn, tlsConfig)
-	tlsConn.SetDeadline(time.Now().Add(timeout))
+	// 3. HTTP Proxy / WebSocket Handshake Check (Реальный эхо-запрос)
+	if transport == "ws" {
+		wsReq := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", path, serverName)
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+		_, err := conn.Write([]byte(wsReq))
+		if err != nil {
+			_ = conn.Close()
+			return ConfigResult{}, false
+		}
 
-	// Пробуем провести хендшейк (работает для VLESS/Trojan/TLS)
-	tlsErr := tlsConn.Handshake()
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil || n == 0 {
+			_ = conn.Close()
+			return ConfigResult{}, false
+		}
+
+		respStr := string(buf[:n])
+		// Проверяем ответы "101 Switching Protocols" или "200 OK"
+		if !strings.Contains(respStr, "101") && !strings.Contains(respStr, "200") && !strings.Contains(respStr, "HTTP/1.1") {
+			_ = conn.Close()
+			return ConfigResult{}, false
+		}
+	}
+
 	latency := time.Since(start)
+	_ = conn.Close()
 
-	// Закрываем соединения
-	_ = tlsConn.Close()
-
-	// Для TLS-протоколов падаем, если хендшейк не прошёл
-	isTLSProtocol := strings.Contains(configStr, "security=tls") || strings.Contains(configStr, "security=reality") || strings.HasPrefix(configStr, "trojan://")
-	if isTLSProtocol && tlsErr != nil {
-		return ConfigResult{}, false
-	}
-
-	// 3. Оценка стойкости к ТСПУ и белым спискам
-	score := calculateBypassScore(configStr, sni, latency)
+	// 4. Оценка пробиваемости Белых Списков
+	score := calculateBypassScore(configStr, port, sni, transport, latency)
 
 	return ConfigResult{
 		URL:     configStr,
@@ -216,71 +251,97 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}, true
 }
 
-func calculateBypassScore(configStr string, sni string, latency time.Duration) int {
+func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration) int {
 	score := 0
 	lower := strings.ToLower(configStr)
 	sniLower := strings.ToLower(sni)
 
-	// 1. Приоритет протоколов
+	// 1. Фильтр Портов (Белые списки режут всё кроме 443/80)
+	if port == "443" {
+		score += 100 // Главный порт для маскировки
+	} else if port == "80" || port == "8080" {
+		score += 20
+	} else {
+		score -= 100 // Нестандартные порты жестко штрафуются
+	}
+
+	// 2. Оценка Протоколов и Транспорта
 	if strings.HasPrefix(lower, "vless://") {
-		score += 80
+		score += 90
 		if strings.Contains(lower, "security=reality") {
-			score += 60 // REALITY обходит ТСПУ/белые списки
+			score += 120 // REALITY — максимальная стойкость к ТСПУ
 		} else if strings.Contains(lower, "security=tls") {
-			score += 20
+			score += 40
 		}
-		if strings.Contains(lower, "type=grpc") {
-			score += 25 // gRPC наименее подвержен фильтрации по длине пакетов
-		} else if strings.Contains(lower, "type=ws") {
-			score += 15
+
+		if transport == "grpc" {
+			score += 50 // gRPC отлично проходит белые списки
+		} else if transport == "ws" {
+			score += 30
 		}
 	} else if strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://") {
-		score += 100 // UDP-маскировка, отлично преодолевает глушение
-	} else if strings.HasPrefix(lower, "tuic://") {
-		score += 90
+		score += 40 // UDP может полностью блокироваться при белых списках
 	} else if strings.HasPrefix(lower, "trojan://") {
-		score += 40
+		score += 30
 	} else {
-		score += 10
+		score -= 60 // Старые протоколы (VMess/SS) без маскировки отсеиваем
 	}
 
-	// 2. Проверка SNI на заблокированные/белые домены
+	// 3. SNI Скоринг
 	if sniLower != "" {
-		for _, blocked := range blockedSNIs {
-			if strings.Contains(sniLower, blocked) {
-				score -= 80 // SNI в блоклисте ТСПУ — высокий шанс бана
-				break
-			}
-		}
 		for _, trusted := range trustedSNIs {
 			if strings.Contains(sniLower, trusted) {
-				score += 30 // SNI из популярного CDN/сервиса
+				score += 70 // Белый домен CDN/сервиса
 				break
 			}
 		}
+	} else if strings.Contains(lower, "security=reality") || strings.Contains(lower, "security=tls") {
+		score -= 80 // TLS/Reality без SNI выйдет из строя
 	}
 
-	// 3. Учитываем пинг
+	// 4. Штраф за задержку (пинг)
 	pingMs := int(latency.Milliseconds())
-	score -= pingMs / 10
+	score -= pingMs / 5
 
 	return score
 }
 
-func parseConfigDetails(configStr string) (host string, port string, sni string) {
+func isBlockedSNI(sni string) bool {
+	if sni == "" {
+		return false
+	}
+	sniLower := strings.ToLower(sni)
+	for _, blocked := range blockedSNIs {
+		if strings.Contains(sniLower, blocked) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string) {
 	u, err := url.Parse(configStr)
 	if err != nil {
-		return "", "", ""
+		return "", "", "", "", ""
 	}
 
 	host = u.Hostname()
 	port = u.Port()
 
-	// Извлекаем SNI из query-параметров (?sni=... или ?peer=...)
 	query := u.Query()
 	sni = query.Get("sni")
 	if sni == "" {
 		sni = query.Get("peer")
+	}
+
+	path = query.Get("path")
+	if path == "" {
+		path = "/"
+	}
+
+	transport = strings.ToLower(query.Get("type"))
+	if transport == "" {
+		transport = strings.ToLower(query.Get("headerType"))
 	}
 
 	if port == "" {
@@ -292,7 +353,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string)
 		}
 	}
 
-	return host, port, sni
+	return host, port, sni, path, transport
 }
 
 func readLines(path string) ([]string, error) {
