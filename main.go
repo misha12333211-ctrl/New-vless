@@ -20,6 +20,11 @@ const (
 	timeout        = 4 * time.Second
 	maxConcurrency = 60
 	maxOutputLimit = 300
+
+	// ЖЕСТКИЕ НАСТРОЙКИ СТРОГОГО РЕЖИМА БЕЛЫХ СПИСКОВ / ТСПУ
+	StrictWhitelistMode = true // Отбрасывать всё, у чего SNI не входит в trustedSNIs
+	StrictVLESSOnly     = true // Пропускать ТОЛЬКО VLESS (Reality/TLS)
+	StrictPortsOnly     = true // Пропускать ТОЛЬКО порты 443 и 80
 )
 
 type ConfigResult struct {
@@ -28,18 +33,44 @@ type ConfigResult struct {
 	Score   int
 }
 
-// Заведомо заблокированные ТСПУ SNI / Домены (Сразу отбрасываем)
+// Заведомо заблокированные ТСПУ SNI / Домены (Мгновенный отказ)
 var blockedSNIs = []string{
 	"instagram.com", "facebook.com", "twitter.com", "x.com",
 	"ytimg.com", "ggpht.com", "googlevideo.com", "notion.so",
 	"t.me", "telegram.org",
 }
 
-// Доверенные CDN / Белые SNI для обхода строгой фильтрации
+// Белый список SNI (Рунет + крупные проверенные CDN)
 var trustedSNIs = []string{
+	// Яндекс
+	"ya.ru", "yandex.ru", "yandex.com", "api-maps.yandex.ru", "avatars.mds.yandex.net",
+	"browser.yandex.ru", "dzen.ru", "kinopoisk.ru", "hd.kinopoisk.ru", "st.kinopoisk.ru",
+	"mail.yandex.ru", "mc.yandex.ru", "strm.yandex.ru", "travel.yandex.ru", "uslugi.yandex.ru",
+	// VK & Mail.ru
+	"vk.com", "vk.ru", "m.vk.com", "api.vk.ru", "id.vk.ru", "login.vk.com",
+	"music.vk.ru", "cloud.vk.ru", "ads.vk.ru", "business.vk.ru", "target.vk.ru",
+	"userapi.com", "vk-portal.net", "mail.ru", "e.mail.ru", "go.mail.ru", "cloud.mail.ru",
+	"my.mail.ru", "news.mail.ru", "auto.mail.ru", "hi-tech.mail.ru", "otvet.mail.ru", "imgsmail.ru",
+	// Маркетплейсы
+	"avito.ru", "m.avito.ru", "avito.st", "ozon.ru", "www.ozon.ru", "bank.ozon.ru",
+	"seller.ozon.ru", "st.ozone.ru", "wb.ru", "a.wb.ru", "finance.wb.ru", "wildberries.ru", "lemanapro.ru",
+	// Банки
+	"sberbank.ru", "online.sberbank.ru", "id.sber.ru", "tbank.ru", "id.tbank.ru",
+	"cdn.tbank.ru", "alfabank.ru", "alfa-mobile.alfabank.ru", "vtb.ru", "www.vtb.ru", "pochtabank.mail.ru",
+	// Гос. сервисы
+	"gosuslugi.ru", "esia.gosuslugi.ru", "lk.gosuslugi.ru", "pos.gosuslugi.ru", "nalog.gov.ru", "sfr.gov.ru",
+	"digital.gov.ru", "duma.gov.ru", "kremlin.ru", "roskachestvo.gov.ru", "pochta.ru", "izbirkom.ru", "mos.ru",
+	// Карты, навигация, транспорт
+	"2gis.ru", "2gis.com", "api.2gis.ru", "catalog.api.2gis.com", "tile0.maps.2gis.com",
+	"rzd.ru", "www.rzd.ru", "ticket.rzd.ru", "cargo.rzd.ru", "travel.rzd.ru", "tutu.ru",
+	// Мессенджеры и медиа
+	"ok.ru", "m.ok.ru", "api.ok.ru", "st.okcdn.ru", "tamtam.ok.ru",
+	"rutube.ru", "static.rutube.ru", "rambler.ru", "lenta.ru", "rbc.ru", "kp.ru", "gazeta.ru",
+	// Операторы связи
+	"beeline.ru", "mts.ru", "megafon.ru", "tele2.ru", "yota.ru", "rt.ru", "rostelecom.ru",
+	// Международные инфраструктурные CDN
 	"cloudflare.com", "microsoft.com", "apple.com", "amazon.com",
 	"yahoo.com", "zoom.us", "deb.debian.org", "cdn.jsdelivr.net",
-	"yandex.ru", "vk.com", "sberbank.ru", "vk.me",
 }
 
 func main() {
@@ -76,7 +107,7 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Собрано %d уникальных конфигов. Начинаем глубокий HTTP/TLS/SNI тест...\n", len(uniqueConfigs))
+	fmt.Printf("Собрано %d уникальных конфигов. Начинаем жесткую фильтрацию под Белые Списки...\n", len(uniqueConfigs))
 
 	resultsChan := make(chan ConfigResult, len(uniqueConfigs))
 	semaphore := make(chan struct{}, maxConcurrency)
@@ -100,14 +131,13 @@ func main() {
 
 	var validResults []ConfigResult
 	for res := range resultsChan {
-		if res.Score > -1000 { // Отфильтровываем забракованные
+		if res.Score > 0 { // Пропускаем только конфиги с положительным счетом
 			validResults = append(validResults, res)
 		}
 	}
 
-	fmt.Printf("Прошли строгую валидацию: %d конфигов.\n", len(validResults))
+	fmt.Printf("Успешно прошли проверку Белых Списков: %d конфигов.\n", len(validResults))
 
-	// Сортировка по итоговым очкам
 	sort.Slice(validResults, func(i, j int) bool {
 		return validResults[i].Score > validResults[j].Score
 	})
@@ -175,15 +205,34 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	// Предварительная проверка SNI: выкидываем заблокированные домены
+	lowerCfg := strings.ToLower(configStr)
+
+	// --- 1. ЖЕСТКАЯ ФИЛЬТРАЦИЯ (HARD DROP) ДО СЕТЕВЫХ ТЕСТОВ ---
+
+	// Проверка портов
+	if StrictPortsOnly && port != "443" && port != "80" {
+		return ConfigResult{}, false
+	}
+
+	// Проверка протокола
+	if StrictVLESSOnly && !strings.HasPrefix(lowerCfg, "vless://") {
+		return ConfigResult{}, false
+	}
+
+	// Проверка заблокированных SNI
 	if isBlockedSNI(sni) {
+		return ConfigResult{}, false
+	}
+
+	// Проверка Белого Списка (Whitelist Check)
+	if StrictWhitelistMode && !isTrustedSNI(sni) {
 		return ConfigResult{}, false
 	}
 
 	targetAddr := net.JoinHostPort(host, port)
 	start := time.Now()
 
-	// 1. TCP Dial
+	// --- 2. TCP DIAL TEST ---
 	rawConn, err := net.DialTimeout("tcp", targetAddr, timeout)
 	if err != nil {
 		return ConfigResult{}, false
@@ -195,9 +244,9 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	var conn net.Conn = rawConn
-	isTLS := strings.Contains(configStr, "security=tls") || strings.Contains(configStr, "security=reality") || strings.HasPrefix(configStr, "trojan://")
+	isTLS := strings.Contains(lowerCfg, "security=tls") || strings.Contains(lowerCfg, "security=reality") || strings.HasPrefix(lowerCfg, "trojan://")
 
-	// 2. TLS / REALITY Handshake Test
+	// --- 3. REALITY / TLS HANDSHAKE TEST ---
 	if isTLS {
 		tlsConfig := &tls.Config{
 			ServerName:         serverName,
@@ -213,7 +262,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		conn = tlsConn
 	}
 
-	// 3. HTTP Proxy / WebSocket Handshake Check (Реальный эхо-запрос)
+	// --- 4. HTTP PROXY / WEBSOCKET HANDSHAKE TEST ---
 	if transport == "ws" {
 		wsReq := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", path, serverName)
 		_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -231,7 +280,6 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		}
 
 		respStr := string(buf[:n])
-		// Проверяем ответы "101 Switching Protocols" или "200 OK"
 		if !strings.Contains(respStr, "101") && !strings.Contains(respStr, "200") && !strings.Contains(respStr, "HTTP/1.1") {
 			_ = conn.Close()
 			return ConfigResult{}, false
@@ -241,7 +289,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	latency := time.Since(start)
 	_ = conn.Close()
 
-	// 4. Оценка пробиваемости Белых Списков
+	// --- 5. ФИНАЛЬНЫЙ СКОРИНГ (Только для оставшихся выживших) ---
 	score := calculateBypassScore(configStr, port, sni, transport, latency)
 
 	return ConfigResult{
@@ -252,54 +300,22 @@ func testConfig(configStr string) (ConfigResult, bool) {
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration) int {
-	score := 0
+	score := 100 // Базовый балл для прошедшего фильтры конфига
 	lower := strings.ToLower(configStr)
-	sniLower := strings.ToLower(sni)
 
-	// 1. Фильтр Портов (Белые списки режут всё кроме 443/80)
-	if port == "443" {
-		score += 100 // Главный порт для маскировки
-	} else if port == "80" || port == "8080" {
-		score += 20
-	} else {
-		score -= 100 // Нестандартные порты жестко штрафуются
+	// Бонус за REALITY
+	if strings.Contains(lower, "security=reality") {
+		score += 100
 	}
 
-	// 2. Оценка Протоколов и Транспорта
-	if strings.HasPrefix(lower, "vless://") {
-		score += 90
-		if strings.Contains(lower, "security=reality") {
-			score += 120 // REALITY — максимальная стойкость к ТСПУ
-		} else if strings.Contains(lower, "security=tls") {
-			score += 40
-		}
-
-		if transport == "grpc" {
-			score += 50 // gRPC отлично проходит белые списки
-		} else if transport == "ws" {
-			score += 30
-		}
-	} else if strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://") {
-		score += 40 // UDP может полностью блокироваться при белых списках
-	} else if strings.HasPrefix(lower, "trojan://") {
+	// Бонус за надежный транспорт
+	if transport == "grpc" {
+		score += 50
+	} else if transport == "ws" {
 		score += 30
-	} else {
-		score -= 60 // Старые протоколы (VMess/SS) без маскировки отсеиваем
 	}
 
-	// 3. SNI Скоринг
-	if sniLower != "" {
-		for _, trusted := range trustedSNIs {
-			if strings.Contains(sniLower, trusted) {
-				score += 70 // Белый домен CDN/сервиса
-				break
-			}
-		}
-	} else if strings.Contains(lower, "security=reality") || strings.Contains(lower, "security=tls") {
-		score -= 80 // TLS/Reality без SNI выйдет из строя
-	}
-
-	// 4. Штраф за задержку (пинг)
+	// Штраф за пинг
 	pingMs := int(latency.Milliseconds())
 	score -= pingMs / 5
 
@@ -313,6 +329,19 @@ func isBlockedSNI(sni string) bool {
 	sniLower := strings.ToLower(sni)
 	for _, blocked := range blockedSNIs {
 		if strings.Contains(sniLower, blocked) {
+			return true
+		}
+	}
+	return false
+}
+
+func isTrustedSNI(sni string) bool {
+	if sni == "" {
+		return false
+	}
+	sniLower := strings.ToLower(sni)
+	for _, trusted := range trustedSNIs {
+		if strings.Contains(sniLower, trusted) {
 			return true
 		}
 	}
