@@ -1,0 +1,10 @@
+https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/main/configs/all.txt
+https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/super-sub.txt
+https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha.txt
+https://gist.githubusercontent.com/tghappcluchi/066594943806449971d68a6472519cb2/raw/6fa56a07d26ca3e275ae7b731f96e106300cecb0/gistfile1.txt
+http://93.115.101.157:14467/free
+https://raw.githubusercontent.com/hiztin/VLESS-PO-GRIBI/main/deploy/subscriptions/12.txt
+https://relaxpanel.owadandomen.ru/sub/K7iQCLOIxoAzQmS4nrTNukIN
+https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat
+https://raw.githubusercontent.com/modrinthmodification-create/ownedvpn/main/subscription.txt
+https://raw.githubusercontent.com/luxxuria/harvester/refs/heads/main/non_ru.txt
