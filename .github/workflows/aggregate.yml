@@ -27,7 +27,7 @@ jobs:
       - name: Deploy to Public Repo
         env:
           PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
-          PUBLIC_REPO: "https://github.com/misha12333211-ctrl/v2ray-aggregator-for-russia" # Укажите ваш публичный репозиторий
+          PUBLIC_REPO: "misha12333211-ctrl/v2ray-aggregator-for-russia" # Укажите ваш публичный репозиторий
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
