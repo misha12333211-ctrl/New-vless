@@ -440,7 +440,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	// 2. Тестирование прохождения трафика через локальный Xray
 	passedServices, mandatoryPassed := checkTargetServicesViaProxy(configStr)
-	
+
 	// Конфиг попадает в подписку, только если работают ВСЕ 7 обязательных сервисов
 	if !mandatoryPassed {
 		return ConfigResult{}, false
@@ -602,8 +602,15 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	}
 
 	u, _ := url.Parse(configURL)
-	query := u.Query()
-	uuid := u.User.Username()
+	var query url.Values
+	var uuid string
+
+	if u != nil {
+		query = u.Query()
+		if u.User != nil {
+			uuid = u.User.Username()
+		}
+	}
 
 	security := query.Get("security")
 	if security == "" {
@@ -644,11 +651,13 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	}
 
 	if netType == "ws" {
+		wsHeader := map[string]interface{}{}
+		if sni != "" {
+			wsHeader["Host"] = sni
+		}
 		streamSettings["wsSettings"] = map[string]interface{}{
-			"path": path,
-			"headers": map[string]interface{}{
-				"Host": sni,
-			},
+			"path":    path,
+			"headers": wsHeader,
 		}
 	} else if netType == "grpc" {
 		streamSettings["grpcSettings"] = map[string]interface{}{
@@ -668,15 +677,33 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 				},
 			},
 		}
-	} else if outboundProtocol == "shadowsocks" {
-		userPass := u.User.String()
+	} else if outboundProtocol == "shadowsocks" || outboundProtocol == "ss" {
 		method := "aes-128-gcm"
-		password := userPass
-		if strings.Contains(userPass, ":") {
-			parts := strings.SplitN(userPass, ":", 2)
-			method = parts[0]
-			password = parts[1]
+		password := ""
+
+		if u != nil && u.User != nil {
+			userPass := u.User.String()
+			if strings.Contains(userPass, ":") {
+				parts := strings.SplitN(userPass, ":", 2)
+				method = parts[0]
+				password = parts[1]
+			} else {
+				if decoded, err := decodeBase64Flex(userPass); err == nil {
+					decStr := string(decoded)
+					if strings.Contains(decStr, ":") {
+						parts := strings.SplitN(decStr, ":", 2)
+						method = parts[0]
+						password = parts[1]
+					} else {
+						password = decStr
+					}
+				} else {
+					password = userPass
+				}
+			}
 		}
+
+		outboundProtocol = "shadowsocks"
 		outboundSettings = map[string]interface{}{
 			"servers": []map[string]interface{}{
 				{
@@ -925,6 +952,29 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		}
 	}
 
+	// Обработка Legacy SS (ss://BASE64@host:port)
+	if strings.HasPrefix(configStr, "ss://") {
+		raw := configStr[5:]
+		if idx := strings.Index(raw, "#"); idx != -1 {
+			raw = raw[:idx]
+		}
+		if idx := strings.Index(raw, "?"); idx != -1 {
+			raw = raw[:idx]
+		}
+		if !strings.Contains(raw, "@") {
+			if decoded, err := decodeBase64Flex(raw); err == nil {
+				decStr := string(decoded)
+				if strings.Contains(decStr, "@") {
+					parts := strings.SplitN(decStr, "@", 2)
+					hostPort := parts[1]
+					if hpParts := strings.SplitN(hostPort, ":", 2); len(hpParts) == 2 {
+						return hpParts[0], hpParts[1], "", "/", "tcp", "ss"
+					}
+				}
+			}
+		}
+	}
+
 	u, err := url.Parse(configStr)
 	if err != nil {
 		return "", "", "", "", "", ""
@@ -958,7 +1008,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		switch proto {
 		case "vless", "vmess", "trojan", "hysteria2", "hy2":
 			port = "443"
-		case "ss":
+		case "ss", "shadowsocks":
 			port = "8388"
 		}
 	}
