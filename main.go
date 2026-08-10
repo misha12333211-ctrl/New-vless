@@ -183,12 +183,12 @@ func main() {
 	var otherConfigs []ConfigResult
 
 	for _, res := range validResults {
-		if res.IsNoSNI {
-			noSNIConfigs = append(noSNIConfigs, res)
-		} else if res.IsRuSNI {
+		if res.IsRuSNI {
 			ruSNIConfigs = append(ruSNIConfigs, res)
 		} else if res.IsReality {
 			realityConfigs = append(realityConfigs, res)
+		} else if res.IsNoSNI {
+			noSNIConfigs = append(noSNIConfigs, res)
 		} else {
 			otherConfigs = append(otherConfigs, res)
 		}
@@ -207,12 +207,12 @@ func main() {
 	}
 
 	sortByScore(ruSNIConfigs)
-	sortByScore(noSNIConfigs)
 	sortByScore(realityConfigs)
+	sortByScore(noSNIConfigs)
 	sortByScore(otherConfigs)
 
-	fmt.Printf("Категории выживаемости: [RU/White-SNI: %d] | [No-SNI: %d] | [REALITY: %d] | [Bypass: %d]\n",
-		len(ruSNIConfigs), len(noSNIConfigs), len(realityConfigs), len(otherConfigs))
+	fmt.Printf("Категории выживаемости: [RU/White-SNI: %d] | [REALITY: %d] | [No-SNI: %d] | [Bypass: %d]\n",
+		len(ruSNIConfigs), len(realityConfigs), len(noSNIConfigs), len(otherConfigs))
 
 	var selected []ConfigResult
 	usedMap := make(map[string]bool)
@@ -229,26 +229,34 @@ func main() {
 		return false
 	}
 
-	// 1. Равномерное наполнение узлами с максимальным обходом ТСПУ
-	targetPerCategory := maxOutputLimit / 3
-	for i := 0; i < targetPerCategory && i < len(ruSNIConfigs); i++ {
+	// 1. Заполняем чуть больше половины (55%) RU-SNI конфигурациями
+	targetRuQuota := int(float64(maxOutputLimit) * 0.55) // ~165 из 300
+	for i := 0; i < len(ruSNIConfigs) && len(selected) < targetRuQuota; i++ {
 		addUnique(ruSNIConfigs[i])
 	}
-	for i := 0; i < targetPerCategory && i < len(noSNIConfigs); i++ {
-		addUnique(noSNIConfigs[i])
-	}
-	for i := 0; i < targetPerCategory && i < len(realityConfigs); i++ {
+
+	// 2. Равномерно распределяем оставшиеся места между REALITY и No-SNI/Bypass
+	remainingQuota := maxOutputLimit - len(selected)
+	targetPerRemaining := remainingQuota / 3
+
+	for i := 0; i < targetPerRemaining && i < len(realityConfigs); i++ {
 		addUnique(realityConfigs[i])
 	}
+	for i := 0; i < targetPerRemaining && i < len(noSNIConfigs); i++ {
+		addUnique(noSNIConfigs[i])
+	}
+	for i := 0; i < targetPerRemaining && i < len(otherConfigs); i++ {
+		addUnique(otherConfigs[i])
+	}
 
-	// 2. Заполнение оставшихся мест лучшими узлами из всех категорий
+	// 3. Если остались свободные места, добираем из всех категорий по старшинству рейтинга
 	for _, res := range ruSNIConfigs {
 		addUnique(res)
 	}
-	for _, res := range noSNIConfigs {
+	for _, res := range realityConfigs {
 		addUnique(res)
 	}
-	for _, res := range realityConfigs {
+	for _, res := range noSNIConfigs {
 		addUnique(res)
 	}
 	for _, res := range otherConfigs {
@@ -257,7 +265,6 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		// Переименование в простую последовательность: Sub 1, Sub 2, Sub 3...
 		renamedURL := setConfigName(r.URL, fmt.Sprintf("Sub %d", i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
@@ -297,7 +304,7 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 		content = string(decoded)
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(content))
+	scanner := bufio.NewScanner(strings.Reader(content))
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, 5*1024*1024)
 
@@ -367,7 +374,8 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	if StrictRuSNIOnly && !isRuSNI(sni) {
+	ruSNI := isRuSNI(sni)
+	if StrictRuSNIOnly && !ruSNI {
 		return ConfigResult{}, false
 	}
 
@@ -439,7 +447,6 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	isReality := strings.Contains(lowerCfg, "security=reality")
-	ruSNI := isRuSNI(sni)
 	noSNI := isNoSNI(sni, host)
 	score := calculateBypassScore(configStr, port, sni, transport, latency, passedServices)
 
@@ -575,8 +582,8 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	allMandatoryPassed := true
 	for _, passed := range mandatoryServices {
 		if !passed {
-			allMandatoryPassed = false;
-			break;
+			allMandatoryPassed = false
+			break
 		}
 	}
 
@@ -839,12 +846,12 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 	score := 100 + (passedServices * 60)
 	lower := strings.ToLower(configStr)
 
-	if strings.Contains(lower, "security=reality") {
-		score += 250
+	if isRuSNI(sni) {
+		score += 300
 	}
 
-	if isRuSNI(sni) {
-		score += 200
+	if strings.Contains(lower, "security=reality") {
+		score += 250
 	}
 
 	if transport == "grpc" {
@@ -913,7 +920,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 				}
 				path, _ = vmap["path"].(string)
 				transport, _ = vmap["net"].(string)
-				return host, port, sni, path, strings.ToLower(transport), "vmess"
+				return host, port, strings.ToLower(sni), path, strings.ToLower(transport), "vmess"
 			}
 		}
 	}
@@ -956,7 +963,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		}
 	}
 
-	return host, port, sni, path, transport, proto
+	return host, port, strings.ToLower(sni), path, transport, proto
 }
 
 func readLines(path string) ([]string, error) {
