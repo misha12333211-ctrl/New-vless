@@ -31,7 +31,7 @@ const (
 	timeout        = 1200 * time.Millisecond
 	serviceTimeout = 3800 * time.Millisecond
 	maxConcurrency = 180
-	maxOutputLimit = 300
+	maxOutputLimit = 350
 
 	// --- НАСТРОЙКИ ЖЕСТКОЙ ФИЛЬТРАЦИИ ---
 	StrictRuSNIOnly = false
