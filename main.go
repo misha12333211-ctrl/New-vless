@@ -887,7 +887,7 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 		}
 	}
 
-	scanner := bufio.NewScanner(strings.Reader(content))
+	scanner := bufio.NewScanner(strings.NewReader(content))
 	buf := make([]byte, 128*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 
