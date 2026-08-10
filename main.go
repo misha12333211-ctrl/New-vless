@@ -29,7 +29,7 @@ import (
 
 const (
 	timeout        = 3500 * time.Millisecond
-	serviceTimeout = 8000 * time.Millisecond
+	serviceTimeout = 9500 * time.Millisecond
 	maxConcurrency = 80  // Оптимизировано под 2 vCPU GitHub Actions
 	maxOutputLimit = 350 // Максимальное количество итоговых конфигов
 
@@ -120,16 +120,19 @@ func main() {
 	rawConfigs := make(chan string, 1000000)
 	var wg sync.WaitGroup
 
+	tr := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:          10000,
+		MaxIdleConnsPerHost:   1000,
+		IdleConnTimeout:       45 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		DisableKeepAlives:     false,
+	}
+	defer tr.CloseIdleConnections()
+
 	sharedHTTPClient := &http.Client{
-		Timeout: 18 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:          10000,
-			MaxIdleConnsPerHost:   1000,
-			IdleConnTimeout:       45 * time.Second,
-			ResponseHeaderTimeout: 15 * time.Second,
-			DisableKeepAlives:     false,
-		},
+		Timeout:   18 * time.Second,
+		Transport: tr,
 	}
 
 	for _, src := range sources {
@@ -385,8 +388,11 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 
 func getFreeLocalPort() (int, error) {
 	// Безопасный подбор свободного порта в диапазоне 20000-45000
-	for i := 0; i < 20; i++ {
-		n, _ := rand.Int(rand.Reader, big.NewInt(25000))
+	for i := 0; i < 30; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(25000))
+		if err != nil {
+			continue
+		}
 		port := int(n.Int64()) + 20000
 		addr := fmt.Sprintf("127.0.0.1:%d", port)
 		l, err := net.Listen("tcp", addr)
@@ -427,6 +433,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
+	// Гарантированное завершение процесса Xray по выходу
 	defer func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
@@ -437,7 +444,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	for i := 0; i < 60; i++ {
+	for i := 0; i < 80; i++ {
 		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
@@ -459,6 +466,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		},
 		DisableKeepAlives: true,
 	}
+	defer httpTransport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: httpTransport,
@@ -492,7 +500,8 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 			if err != nil {
 				return
 			}
-			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
 				atomic.AddInt64(&successCount, 1)
@@ -531,13 +540,24 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		port = 443
 	}
 
-	u, _ := url.Parse(configURL)
 	var query url.Values
 	var uuid string
-	if u != nil {
+
+	u, err := url.Parse(configURL)
+	if err == nil && u != nil {
 		query = u.Query()
 		if u.User != nil {
 			uuid = u.User.Username()
+		}
+	} else {
+		query = make(url.Values)
+	}
+
+	if uuid == "" && strings.Contains(configURL, "@") {
+		parts := strings.SplitN(configURL, "@", 2)
+		schemeSep := strings.Index(parts[0], "://")
+		if schemeSep != -1 {
+			uuid = parts[0][schemeSep+3:]
 		}
 	}
 
@@ -558,6 +578,10 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	}
 
 	flow := query.Get("flow")
+
+	if netType == "" {
+		netType = "tcp"
+	}
 
 	streamSettings := map[string]interface{}{
 		"network":  netType,
@@ -599,8 +623,12 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 			"headers": headers,
 		}
 	} else if netType == "grpc" {
+		serviceName := query.Get("serviceName")
+		if serviceName == "" {
+			serviceName = query.Get("path")
+		}
 		streamSettings["grpcSettings"] = map[string]interface{}{
-			"serviceName": query.Get("serviceName"),
+			"serviceName": serviceName,
 			"multiMode":   query.Get("mode") == "multi",
 		}
 	}
@@ -615,6 +643,22 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 					"address":  host,
 					"port":     port,
 					"password": uuid,
+				},
+			},
+		}
+	case "vmess":
+		outboundSettings = map[string]interface{}{
+			"vnext": []map[string]interface{}{
+				{
+					"address": host,
+					"port":    port,
+					"users": []map[string]interface{}{
+						{
+							"id":       uuid,
+							"alterId":  0,
+							"security": "auto",
+						},
+					},
 				},
 			},
 		}
@@ -637,22 +681,8 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 				},
 			},
 		}
-	case "hysteria2", "hy2":
-		outboundProtocol = "vless" // Обертка совместимости
-		userSettings := map[string]interface{}{
-			"id":         uuid,
-			"encryption": "none",
-		}
-		outboundSettings = map[string]interface{}{
-			"vnext": []map[string]interface{}{
-				{
-					"address": host,
-					"port":    port,
-					"users":   []map[string]interface{}{userSettings},
-				},
-			},
-		}
-	default: // vless / vmess
+	default: // vless & compatibility
+		outboundProtocol = "vless"
 		userSettings := map[string]interface{}{
 			"id":         uuid,
 			"encryption": "none",
@@ -788,16 +818,18 @@ func ensureCoreAvailable() {
 			if err != nil {
 				return
 			}
-			defer rc.Close()
 
 			outPath := filepath.Join(cwd, targetExe)
 			outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 			if err != nil {
+				rc.Close()
 				return
 			}
-			defer outFile.Close()
 
 			_, err = io.Copy(outFile, rc)
+			rc.Close()
+			outFile.Close()
+
 			if err == nil {
 				_ = os.Chmod(outPath, 0755)
 				fmt.Printf("Xray Core успешно загружен: (%s)\n", outPath)
@@ -818,7 +850,10 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	if err != nil {
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
 	if err != nil {
@@ -829,11 +864,9 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 }
 
 func decodeSubscriptionContent(content string, out chan<- string) {
-	// Очищаем UTF-8 BOM
 	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
 	content = strings.TrimSpace(content)
 
-	// Многоуровневое декодирование Base64
 	for i := 0; i < 3; i++ {
 		cleaned := cleanBase64Fast(content)
 		if len(cleaned) < 16 {
@@ -868,6 +901,7 @@ func sanitizeProxyURL(u string) string {
 	u = strings.TrimSpace(u)
 	u = strings.ReplaceAll(u, "\r", "")
 	u = strings.ReplaceAll(u, "\n", "")
+	u = strings.ReplaceAll(u, " ", "%20")
 	return u
 }
 
@@ -918,7 +952,7 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 	lower := strings.ToLower(configStr)
 
 	if isRuSNI(sni) {
-		score += 350 // Высокий приоритет для Белых Списков
+		score += 350
 	}
 
 	if strings.Contains(lower, "security=reality") || strings.Contains(lower, "pbk=") {
@@ -967,10 +1001,11 @@ func isNoSNI(sni string, host string) bool {
 }
 
 func setConfigName(configURL string, name string) string {
+	safeName := strings.ReplaceAll(name, " ", "-")
 	if idx := strings.Index(configURL, "#"); idx != -1 {
-		return configURL[:idx] + "#" + url.QueryEscape(name)
+		return configURL[:idx] + "#" + safeName
 	}
-	return configURL + "#" + url.QueryEscape(name)
+	return configURL + "#" + safeName
 }
 
 func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string) {
@@ -998,7 +1033,6 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		}
 	}
 
-	// Полноценный парсинг Shadowsocks (ss://)
 	if strings.HasPrefix(configStr, "ss://") {
 		raw := configStr[5:]
 		if idx := strings.Index(raw, "#"); idx != -1 {
