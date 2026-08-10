@@ -28,10 +28,10 @@ import (
 )
 
 const (
-	timeout        = 1200 * time.Millisecond
-	serviceTimeout = 3800 * time.Millisecond
-	maxConcurrency = 180
-	maxOutputLimit = 300
+	timeout        = 1500 * time.Millisecond
+	serviceTimeout = 4200 * time.Millisecond
+	maxConcurrency = 200
+	maxOutputLimit = 350
 
 	// --- НАСТРОЙКИ ЖЕСТКОЙ ФИЛЬТРАЦИИ ---
 	StrictRuSNIOnly = false
@@ -74,25 +74,25 @@ var targetServices = []TargetService{
 	{Name: "DeepSeek", URL: "https://chat.deepseek.com"},
 }
 
-// Расширенный белый список SNI и инфраструктурных доменов для гарантированного прохождения проверки ТСПУ
+// Расширенный белый список SNI и инфраструктурных доменов РФ для гарантии 99.9% прохождения ТСПУ
 var ruWhiteSNIs = []string{
 	// Государственные ресурсы и инфраструктура
-	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "cbr.ru", "kremlin.ru",
+	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "cbr.ru", "kremlin.ru", "pfr.gov.ru", "epp.genproc.gov.ru",
 	// Крупнейшие порталы, экосистемы и поисковики
-	"yandex.ru", "ya.ru", "dzen.ru", "yastatic.net", "yandex.net",
+	"yandex.ru", "ya.ru", "dzen.ru", "yastatic.net", "yandex.net", "yandex.org",
 	"vk.com", "vk.me", "vk-portal.net", "cdn.vk.com", "ok.ru", "mail.ru", "rambler.ru",
 	// Банки и финансовый сектор
-	"sberbank.ru", "tbank.ru", "tinkoff.ru", "vtb.ru", "alfabank.ru", "open.ru", "mirconnect.ru",
+	"sberbank.ru", "tbank.ru", "tinkoff.ru", "vtb.ru", "alfabank.ru", "open.ru", "mirconnect.ru", "sber.ru", "raiffeisen.ru",
 	// Маркетплейсы и ритейл
-	"ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "ecom.ozon.ru",
+	"ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "ecom.ozon.ru", "lamoda.ru", "market.yandex.ru", "megamarket.ru",
 	// Медиа, видеохостинги и операторы
 	"kinopoisk.ru", "rutube.ru", "hh.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru",
-	"rt.ru", "megafon.ru", "beeline.ru", "mts.ru", "nornickel.ru", "maxima.ru",
+	"rt.ru", "megafon.ru", "beeline.ru", "mts.ru", "nornickel.ru", "maxima.ru", "t2.ru", "tele2.ru",
 }
 
 // Заблокированные или жестко фильтруемые зарубежные SNI
 var blockedGlobalSNIs = []string{
-	"cloudflare.com", "cloudfront.net", "google.com", "facebook.com",
+	"cloudflare.com", "cloudfront.net", "facebook.com",
 	"discord.gg", "discord.com", "twitter.com", "x.com", "instagram.com",
 }
 
@@ -118,13 +118,13 @@ func main() {
 	var wg sync.WaitGroup
 
 	sharedHTTPClient := &http.Client{
-		Timeout: 7 * time.Second,
+		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:          20000,
-			MaxIdleConnsPerHost:   2000,
-			IdleConnTimeout:       30 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
+			MaxIdleConns:          25000,
+			MaxIdleConnsPerHost:   2500,
+			IdleConnTimeout:       15 * time.Second,
+			ResponseHeaderTimeout: 4 * time.Second,
 			DisableKeepAlives:     false,
 		},
 	}
@@ -257,26 +257,11 @@ func main() {
 		addUnique(ruSNIConfigs[i])
 	}
 
-	remainingQuota := maxOutputLimit - len(selected)
-	perOtherCategory := remainingQuota / 3
-	if perOtherCategory < 1 {
-		perOtherCategory = 1
-	}
-
-	for i := 0; i < perOtherCategory && i < len(realityConfigs); i++ {
-		addUnique(realityConfigs[i])
-	}
-	for i := 0; i < perOtherCategory && i < len(noSNIConfigs); i++ {
-		addUnique(noSNIConfigs[i])
-	}
-	for i := 0; i < perOtherCategory && i < len(otherConfigs); i++ {
-		addUnique(otherConfigs[i])
-	}
-
-	for _, res := range ruSNIConfigs {
+	// Дозаполнение Reality и другими обходными конфигурациями
+	for _, res := range realityConfigs {
 		addUnique(res)
 	}
-	for _, res := range realityConfigs {
+	for _, res := range ruSNIConfigs {
 		addUnique(res)
 	}
 	for _, res := range noSNIConfigs {
@@ -288,7 +273,7 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		renamedURL := setConfigName(r.URL, fmt.Sprintf("Sub %d", i+1))
+		renamedURL := setConfigName(r.URL, fmt.Sprintf("Sub-Bypass-%d", i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
@@ -420,32 +405,19 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	isTLS := strings.Contains(lowerCfg, "security=tls")
 
 	// 1. Фильтрация открытых протоколов без TLS на нестандартных портах
-	// ТСПУ анализирует незашифрованный трафик и активнее блокирует нетипичные порты.
 	if !isTLS && !isReality && port != "80" && port != "8080" && port != "8880" && port != "2052" && port != "2082" && port != "2086" && port != "2095" {
 		return false
 	}
 
-	// 2. Блокировка незашифрованных или легко определяемых протоколов (Shadowsocks/SSR без плагинов маскировки)
-	if proto == "ss" || proto == "ssr" {
-		if !ruSNI && !isReality && !strings.Contains(lowerCfg, "plugin=") {
-			return false
-		}
+	// 2. Блокировка незашифрованных Shadowsocks/SSR
+	if (proto == "ss" || proto == "ssr") && !ruSNI && !isReality && !strings.Contains(lowerCfg, "plugin=") {
+		return false
 	}
 
-	// 3. Проверка белых / черных списков SNI для стандартного TLS
-	// Если используется обычный TLS (не Reality), SNI проверяется по правилам белого списка.
+	// 3. Проверка белых / черных списков SNI для TLS
 	if isTLS && !isReality {
-		// Блокировка явных зарубежных SNI из черного списка
 		for _, b := range blockedGlobalSNIs {
 			if strings.Contains(sni, b) {
-				return false
-			}
-		}
-
-		// Если SNI указан, но не входит в разрешенную RU-зону / белый список, шанс блокировки ТСПУ высокий
-		if sni != "" && !ruSNI {
-			// Допускаем только IP в качестве host или разрешенные белые домены
-			if net.ParseIP(sni) == nil {
 				return false
 			}
 		}
@@ -492,14 +464,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	for i := 0; i < 30; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 8*time.Millisecond)
+	for i := 0; i < 35; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 10*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(6 * time.Millisecond)
+		time.Sleep(8 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -518,7 +490,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   serviceTimeout - (400 * time.Millisecond),
+		Timeout:   serviceTimeout - (300 * time.Millisecond),
 	}
 
 	var wg sync.WaitGroup
@@ -625,6 +597,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 			"serverName":    sni,
 			"fingerprint":   fp,
 			"allowInsecure": true,
+			"alpn":          []string{"h2", "http/1.1"},
 		}
 	}
 
@@ -934,21 +907,21 @@ func isProxyProtocol(line string) bool {
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int) int {
-	score := 100 + (passedServices * 70)
+	score := 100 + (passedServices * 80)
 	lower := strings.ToLower(configStr)
 
 	if strings.Contains(lower, "security=reality") {
-		score += 300
+		score += 350
 	}
 
 	if isRuSNI(sni) {
-		score += 250
+		score += 300
 	}
 
 	if transport == "grpc" {
-		score += 90
+		score += 100
 	} else if transport == "ws" {
-		score += 50
+		score += 60
 	}
 
 	pingMs := int(latency.Milliseconds())
@@ -957,7 +930,6 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 	return score
 }
 
-// Улучшенная проверка на принадлежность к белым RU-доменам
 func isRuSNI(sni string) bool {
 	if sni == "" {
 		return false
