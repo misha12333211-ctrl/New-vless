@@ -27,9 +27,9 @@ import (
 )
 
 const (
-	timeout        = 2500 * time.Millisecond
-	serviceTimeout = 4000 * time.Millisecond
-	maxConcurrency = 60  // Увеличено для максимального ускорения на Runner
+	timeout        = 2000 * time.Millisecond
+	serviceTimeout = 6000 * time.Millisecond
+	maxConcurrency = 80  // Оптимизировано под 2 vCPU GitHub Actions Runner
 	maxOutputLimit = 300 // Лимит итоговых конфигов ровно 300
 
 	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
@@ -46,6 +46,7 @@ type ConfigResult struct {
 	SNI            string
 	IsRuSNI        bool
 	IsNoSNI        bool
+	IsReality      bool
 }
 
 type TargetService struct {
@@ -71,7 +72,15 @@ var targetServices = []TargetService{
 var blockedSNIs = []string{
 	"instagram.com", "facebook.com", "twitter.com", "x.com",
 	"ytimg.com", "ggpht.com", "googlevideo.com", "notion.so",
-	"t.me", "telegram.org", "cdninstagram.com",
+	"t.me", "telegram.org", "cdninstagram.com", "medium.com",
+}
+
+// Список проверенных белых SNI РФ для работы в условия строгого белого списка ТСПУ
+var ruWhiteSNIs = []string{
+	"vk.com", "yandex.ru", "ya.ru", "vk.me", "ok.ru", "mail.ru",
+	"ozon.ru", "wildberries.ru", "gosuslugi.ru", "sberbank.ru",
+	"tbank.ru", "tinkoff.ru", "kinopoisk.ru", "avito.ru", "rutube.ru",
+	"rambler.ru", "hh.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru",
 }
 
 func main() {
@@ -84,7 +93,7 @@ func main() {
 
 	sources, err := readLines("sources.txt")
 	if err != nil {
-		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустой файл.\n", err)
+		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые файлы.\n", err)
 		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
@@ -93,16 +102,19 @@ func main() {
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
 	fmt.Println("=== [2/5] Сбор и декодирование прокси-конфигураций ===")
 
-	rawConfigs := make(chan string, 500000)
+	rawConfigs := make(chan string, 1000000)
 	var wg sync.WaitGroup
 
+	// Высокопроизводительный HTTP клиент для параллельного скачивания подписок
 	sharedHTTPClient := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 12 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:        1000,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     30 * time.Second,
+			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:          2000,
+			MaxIdleConnsPerHost:   200,
+			IdleConnTimeout:       30 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+			DisableKeepAlives:     false,
 		},
 	}
 
@@ -153,7 +165,7 @@ func main() {
 			}
 
 			curr := atomic.AddInt64(&processedCount, 1)
-			if curr%100 == 0 || curr == int64(totalConfigs) {
+			if curr%200 == 0 || curr == int64(totalConfigs) {
 				fmt.Printf("Проверено: %d / %d\r", curr, totalConfigs)
 			}
 		}(cfg)
@@ -175,6 +187,7 @@ func main() {
 	// Разделение валидных результатов по категориям
 	var ruSNIConfigs []ConfigResult
 	var noSNIConfigs []ConfigResult
+	var realityConfigs []ConfigResult
 	var otherConfigs []ConfigResult
 
 	for _, res := range validResults {
@@ -182,6 +195,8 @@ func main() {
 			noSNIConfigs = append(noSNIConfigs, res)
 		} else if res.IsRuSNI {
 			ruSNIConfigs = append(ruSNIConfigs, res)
+		} else if res.IsReality {
+			realityConfigs = append(realityConfigs, res)
 		} else {
 			otherConfigs = append(otherConfigs, res)
 		}
@@ -199,9 +214,11 @@ func main() {
 
 	sortByScoreAndServices(ruSNIConfigs)
 	sortByScoreAndServices(noSNIConfigs)
+	sortByScoreAndServices(realityConfigs)
 	sortByScoreAndServices(otherConfigs)
 
-	fmt.Printf("Найдено: [RU/Белые SNI: %d] | [Без SNI: %d] | [Остальные: %d]\n", len(ruSNIConfigs), len(noSNIConfigs), len(otherConfigs))
+	fmt.Printf("Найдено: [RU/Белые SNI: %d] | [Без SNI: %d] | [REALITY: %d] | [Остальные: %d]\n",
+		len(ruSNIConfigs), len(noSNIConfigs), len(realityConfigs), len(otherConfigs))
 
 	// Формирование сбалансированного МИКСА до 300 конфигов
 	var selected []ConfigResult
@@ -219,24 +236,30 @@ func main() {
 		return false
 	}
 
-	// 1. Берем приоритетно до 150 с RU SNI и до 150 Без SNI
-	targetPerCategory := maxOutputLimit / 2
+	// 1. Приоритетный выбор для обхода 99% блокировок в РФ (RU SNI, NoSNI и REALITY)
+	targetPerCategory := maxOutputLimit / 3
 	for i := 0; i < targetPerCategory && i < len(ruSNIConfigs); i++ {
 		addUnique(ruSNIConfigs[i])
 	}
 	for i := 0; i < targetPerCategory && i < len(noSNIConfigs); i++ {
 		addUnique(noSNIConfigs[i])
 	}
+	for i := 0; i < targetPerCategory && i < len(realityConfigs); i++ {
+		addUnique(realityConfigs[i])
+	}
 
-	// 2. Если до 300 не добрали, дозаполняем оставшимися RU SNI и Без SNI
+	// 2. Если до 300 не добрали, дозаполняем белыми списками и обходными узлами
 	for _, res := range ruSNIConfigs {
 		addUnique(res)
 	}
 	for _, res := range noSNIConfigs {
 		addUnique(res)
 	}
+	for _, res := range realityConfigs {
+		addUnique(res)
+	}
 
-	// 3. Если всё еще меньше 300, добираем из остальных лучших узлов (Reality и др.)
+	// 3. Если всё еще меньше 300, добираем из остальных лучших узлов
 	for _, res := range otherConfigs {
 		addUnique(res)
 	}
@@ -248,6 +271,8 @@ func main() {
 			tag = "NoSNI"
 		} else if r.IsRuSNI {
 			tag = "RU-SNI"
+		} else if r.IsReality {
+			tag = "REALITY"
 		} else {
 			tag = "Bypass"
 		}
@@ -281,7 +306,8 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 100*1024*1024))
+	// Ограничиваем считывание до 30 МБ для предотвращения переполнения ОЗУ
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 30*1024*1024))
 	if err != nil {
 		return
 	}
@@ -295,7 +321,7 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 20*1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -373,7 +399,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	targetAddr := net.JoinHostPort(host, port)
 	start := time.Now()
 
-	// 1. Предварительный быстрейший TCP/TLS пинг
+	// 1. Быстрый TCP/TLS первично-агрессивный пинг
 	dialer := &net.Dialer{Timeout: timeout}
 	rawConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
@@ -429,13 +455,14 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	latency := time.Since(start)
 	_ = conn.Close()
 
-	// 2. Глубокий тест через Xray (только для выживших сокетов)
+	// 2. Глубокий тест через Xray (для выживших узлов)
 	passedServices := checkTargetServicesViaProxy(configStr)
 
 	if passedServices == 0 {
 		return ConfigResult{}, false
 	}
 
+	isReality := strings.Contains(lowerCfg, "security=reality")
 	score := calculateBypassScore(configStr, port, sni, transport, latency, passedServices)
 	ruSNI := isRuSNI(sni)
 	noSNI := isNoSNI(sni, host)
@@ -448,6 +475,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		SNI:            sni,
 		IsRuSNI:        ruSNI,
 		IsNoSNI:        noSNI,
+		IsReality:      isReality,
 	}, true
 }
 
@@ -457,6 +485,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 		return 0
 	}
 
+	// Безопасное выделение порта без сокетных коллизий
 	listener, socksPort, err := getFreeTCPListener()
 	if err != nil {
 		return 0
@@ -489,14 +518,16 @@ func checkTargetServicesViaProxy(configStr string) int {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 15; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
+
+	// Быстрая проверка Readiness SOCKS5 порта
+	for i := 0; i < 20; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 15*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -514,7 +545,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   serviceTimeout,
+		Timeout:   serviceTimeout - (500 * time.Millisecond),
 	}
 
 	var wg sync.WaitGroup
@@ -842,12 +873,18 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 	score := 100 + (passedServices * 50)
 	lower := strings.ToLower(configStr)
 
+	// Высокий приоритет Reality (устойчивость к ТСПУ)
 	if strings.Contains(lower, "security=reality") {
+		score += 200
+	}
+
+	// Начисление баллов за RU-SNI для белых списков
+	if isRuSNI(sni) {
 		score += 150
 	}
 
 	if transport == "grpc" {
-		score += 50
+		score += 60
 	} else if transport == "ws" {
 		score += 30
 	}
@@ -876,6 +913,13 @@ func isRuSNI(sni string) bool {
 		return false
 	}
 	sniLower := strings.ToLower(strings.TrimSpace(sni))
+
+	// Проверка на занесенные в белый список домены РФ
+	for _, ruDomain := range ruWhiteSNIs {
+		if strings.HasSuffix(sniLower, ruDomain) || sniLower == ruDomain {
+			return true
+		}
+	}
 
 	if strings.HasSuffix(sniLower, ".ru") || strings.HasSuffix(sniLower, ".su") || strings.HasSuffix(sniLower, ".xn--p1ai") || strings.HasSuffix(sniLower, ".рф") {
 		return true
