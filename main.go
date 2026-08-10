@@ -69,19 +69,32 @@ var blockedSNIs = []string{
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	_ = rng
 
 	// Подготовка ядра Xray для GitHub Actions или локальной среды
 	ensureCoreAvailable()
 
 	sources, err := readLines("sources.txt")
 	if err != nil {
-		fmt.Printf("Ошибка чтения sources.txt: %v\n", err)
+		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустой файл для избежания фатального сбоя CI/CD.\n", err)
+		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
+		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
 
-	rawConfigs := make(chan string, 20000)
+	rawConfigs := make(chan string, 50000)
 	var wg sync.WaitGroup
+
+	// Общий HTTP клиент с таймаутами для загрузки источников
+	sharedHTTPClient := &http.Client{
+		Timeout: 12 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+		},
+	}
 
 	for _, src := range sources {
 		src = strings.TrimSpace(src)
@@ -91,7 +104,7 @@ func main() {
 		wg.Add(1)
 		go func(targetURL string) {
 			defer wg.Done()
-			fetchSubscription(targetURL, rawConfigs)
+			fetchSubscriptionWithClient(sharedHTTPClient, targetURL, rawConfigs)
 		}(src)
 	}
 
@@ -168,20 +181,14 @@ func main() {
 	fmt.Println("Файлы output_raw.txt и output_base64.txt успешно обновлены.")
 }
 
-func fetchSubscription(targetURL string, out chan<- string) {
-	client := http.Client{
-		Timeout: 12 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan<- string) {
 	resp, err := client.Get(targetURL)
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 15*1024*1024)) // Ограничение размера 15MB
 	if err != nil {
 		return
 	}
@@ -349,7 +356,8 @@ func testConfig(configStr string) (ConfigResult, bool) {
 func checkTargetServicesViaProxy(configStr string) int {
 	corePath := findCoreExecutable()
 	if corePath == "" {
-		return checkTargetServices(configStr)
+		// Предотвращение ложных срабатываний без запущенного Xray туннеля
+		return 0
 	}
 
 	socksPort, err := getFreePort()
@@ -517,6 +525,16 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	}
 	flow := query.Get("flow")
 
+	// Определение протокола
+	outboundProtocol := "vless"
+	if strings.HasPrefix(configURL, "trojan://") {
+		outboundProtocol = "trojan"
+	} else if strings.HasPrefix(configURL, "vmess://") {
+		outboundProtocol = "vmess"
+	} else if strings.HasPrefix(configURL, "ss://") {
+		outboundProtocol = "shadowsocks"
+	}
+
 	streamSettings := map[string]interface{}{
 		"network":  netType,
 		"security": security,
@@ -550,12 +568,41 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		}
 	}
 
-	userMap := map[string]interface{}{
-		"id":         uuid,
-		"encryption": "none",
+	var userSettings map[string]interface{}
+	if outboundProtocol == "trojan" {
+		userSettings = map[string]interface{}{
+			"password": uuid,
+		}
+	} else {
+		userSettings = map[string]interface{}{
+			"id":         uuid,
+			"encryption": "none",
+		}
+		if flow != "" {
+			userSettings["flow"] = flow
+		}
 	}
-	if flow != "" {
-		userMap["flow"] = flow
+
+	outboundSettings := map[string]interface{}{
+		"vnext": []map[string]interface{}{
+			{
+				"address": host,
+				"port":    port,
+				"users":   []map[string]interface{}{userSettings},
+			},
+		},
+	}
+
+	if outboundProtocol == "trojan" {
+		outboundSettings = map[string]interface{}{
+			"servers": []map[string]interface{}{
+				{
+					"address":  host,
+					"port":     port,
+					"password": uuid,
+				},
+			},
+		}
 	}
 
 	config := map[string]interface{}{
@@ -575,16 +622,8 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		},
 		"outbounds": []map[string]interface{}{
 			{
-				"protocol": "vless",
-				"settings": map[string]interface{}{
-					"vnext": []map[string]interface{}{
-						{
-							"address": host,
-							"port":    port,
-							"users":   []map[string]interface{}{userMap},
-						},
-					},
-				},
+				"protocol":       outboundProtocol,
+				"settings":       outboundSettings,
 				"streamSettings": streamSettings,
 			},
 		},
@@ -594,9 +633,10 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 }
 
 func getFreePort() (int, error) {
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 50; i++ {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
+			time.Sleep(5 * time.Millisecond)
 			continue
 		}
 		port := l.Addr().(*net.TCPAddr).Port
@@ -719,56 +759,6 @@ func ensureCoreAvailable() {
 // ----------------------------------------------------------------------------------
 //   ВСЕ ОСТАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ----------------------------------------------------------------------------------
-
-func checkTargetServices(configStr string) int {
-	var wg sync.WaitGroup
-	successChan := make(chan bool, len(targetServices))
-
-	for _, service := range targetServices {
-		wg.Add(1)
-		go func(s TargetService) {
-			defer wg.Done()
-
-			ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout)
-			defer cancel()
-
-			req, err := http.NewRequestWithContext(ctx, "GET", s.URL, nil)
-			if err != nil {
-				successChan <- false
-				return
-			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-			client := &http.Client{
-				Timeout: serviceTimeout,
-			}
-
-			resp, err := client.Do(req)
-			if err != nil {
-				successChan <- false
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-				successChan <- true
-			} else {
-				successChan <- false
-			}
-		}(service)
-	}
-
-	wg.Wait()
-	close(successChan)
-
-	count := 0
-	for ok := range successChan {
-		if ok {
-			count++
-		}
-	}
-	return count
-}
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int) int {
 	score := 100 + (passedServices * 50)
