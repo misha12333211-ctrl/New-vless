@@ -23,3 +23,4 @@ https://yax.nenadoblokirowatgnidda.ru/exec?url=http%3A%2F%2F77.110.104.181%3A500
 https://raw.githubusercontent.com/flaafix/AetrisVPN/refs/heads/main/AetrisVPN.txt
 https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt
 https://raw.githubusercontent.com/flaafix/AetrisVPN-white-list-lite/refs/heads/main/AetrisVPN.txt
+https://sub.vlessfo.ru/vlessforu/working_configs.txt
