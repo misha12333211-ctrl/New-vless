@@ -18,3 +18,8 @@ https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt
 https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt
 https://github.com/Epodonios/v2ray-configs/raw/main/All_Configs_Sub.txt
 https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/refs/heads/main/data/githubmirror/ru-sni-local/vless.txt
+https://mifa.world/tetra
+https://yax.nenadoblokirowatgnidda.ru/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2FdGdyLDE3ODYzNDQzNjkU6D87tr1lu
+https://raw.githubusercontent.com/flaafix/AetrisVPN/refs/heads/main/AetrisVPN.txt
+https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt
+https://raw.githubusercontent.com/flaafix/AetrisVPN-white-list-lite/refs/heads/main/AetrisVPN.txt
