@@ -54,7 +54,7 @@ type TargetService struct {
 	URL  string
 }
 
-// Обязательные сервисы для проверки сквозного доступа
+// Обязательные сервисы для проверки сквозного доступа (Telegram, YouTube, Instagram, WhatsApp, Viber, Google, GitHub + дополнительные)
 var targetServices = []TargetService{
 	{Name: "Google", URL: "https://www.google.com/generate_204"},
 	{Name: "YouTube", URL: "https://www.youtube.com"},
@@ -66,13 +66,6 @@ var targetServices = []TargetService{
 	{Name: "Gemini", URL: "https://gemini.google.com"},
 	{Name: "ChatGPT", URL: "https://chatgpt.com"},
 	{Name: "DeepSeek", URL: "https://chat.deepseek.com"},
-}
-
-// Заведомо заблокированные ТСПУ SNI / Домены
-var blockedSNIs = []string{
-	"instagram.com", "facebook.com", "twitter.com", "x.com",
-	"ytimg.com", "ggpht.com", "googlevideo.com", "notion.so",
-	"t.me", "telegram.org", "cdninstagram.com", "medium.com",
 }
 
 // Расширенные белые SNI / Домены РФ для работы в условиях жестких белых списков ТСПУ (до 99% доступности)
@@ -374,10 +367,6 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	if isBlockedSNI(sni) {
-		return ConfigResult{}, false
-	}
-
 	if StrictRuSNIOnly && !isRuSNI(sni) {
 		return ConfigResult{}, false
 	}
@@ -442,8 +431,10 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	_ = conn.Close()
 
 	// 2. Тестирование прохождения трафика через локальный Xray
-	passedServices := checkTargetServicesViaProxy(configStr)
-	if passedServices == 0 {
+	passedServices, mandatoryPassed := checkTargetServicesViaProxy(configStr)
+	
+	// Конфиг попадает в подписку, только если работают ВСЕ 7 обязательных сервисов
+	if !mandatoryPassed {
 		return ConfigResult{}, false
 	}
 
@@ -465,23 +456,23 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}, true
 }
 
-func checkTargetServicesViaProxy(configStr string) int {
+func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	corePath := findCoreExecutable()
 	if corePath == "" {
-		return 0
+		return 0, false
 	}
 
 	// Выделение свободного TCP порта
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 0
+		return 0, false
 	}
 	socksPort := listener.Addr().(*net.TCPAddr).Port
 	_ = listener.Close()
 
 	xrayConfigJSON, err := generateXrayConfig(configStr, socksPort)
 	if err != nil {
-		return 0
+		return 0, false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout)
@@ -493,7 +484,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
-		return 0
+		return 0, false
 	}
 
 	// Гарантированная очистка Xray процесса после тестирования
@@ -518,7 +509,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 	}
 
 	if !proxyReady {
-		return 0
+		return 0, false
 	}
 
 	proxyURL, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", socksPort))
@@ -537,6 +528,18 @@ func checkTargetServicesViaProxy(configStr string) int {
 
 	var wg sync.WaitGroup
 	var successCount int64
+
+	// Карта результатов для проверки обязательных сервисов
+	mandatoryServices := map[string]bool{
+		"Google":    false,
+		"YouTube":   false,
+		"Instagram": false,
+		"Telegram":  false,
+		"WhatsApp":  false,
+		"Viber":     false,
+		"GitHub":    false,
+	}
+	var mapMutex sync.Mutex
 
 	for _, service := range targetServices {
 		wg.Add(1)
@@ -557,12 +560,27 @@ func checkTargetServicesViaProxy(configStr string) int {
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
 				atomic.AddInt64(&successCount, 1)
+				mapMutex.Lock()
+				if _, exists := mandatoryServices[s.Name]; exists {
+					mandatoryServices[s.Name] = true
+				}
+				mapMutex.Unlock()
 			}
 		}(service)
 	}
 
 	wg.Wait()
-	return int(atomic.LoadInt64(&successCount))
+
+	// Проверяем, прошли ли проверку ВСЕ 7 обязательных сервисов
+	allMandatoryPassed := true
+	for _, passed := range mandatoryServices {
+		if !passed {
+			allMandatoryPassed = false;
+			break;
+		}
+	}
+
+	return int(atomic.LoadInt64(&successCount)), allMandatoryPassed
 }
 
 func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
@@ -839,19 +857,6 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 	score -= pingMs / 4
 
 	return score
-}
-
-func isBlockedSNI(sni string) bool {
-	if sni == "" {
-		return false
-	}
-	sniLower := strings.ToLower(sni)
-	for _, blocked := range blockedSNIs {
-		if strings.Contains(sniLower, blocked) {
-			return true
-		}
-	}
-	return false
 }
 
 func isRuSNI(sni string) bool {
