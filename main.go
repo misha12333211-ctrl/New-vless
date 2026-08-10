@@ -27,10 +27,10 @@ import (
 )
 
 const (
-	timeout        = 2000 * time.Millisecond
-	serviceTimeout = 6000 * time.Millisecond
-	maxConcurrency = 80  // Оптимизировано под 2 vCPU GitHub Actions Runner
-	maxOutputLimit = 300 // Лимит итоговых конфигов ровно 300
+	timeout        = 1800 * time.Millisecond
+	serviceTimeout = 5000 * time.Millisecond
+	maxConcurrency = 120 // Оптимальная параллельность для 2 vCPU GitHub Runner
+	maxOutputLimit = 300 // Итоговый лимит топовых конфигов
 
 	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
 	StrictRuSNIOnly = false
@@ -44,6 +44,7 @@ type ConfigResult struct {
 	Score          int
 	ServiceSuccess int
 	SNI            string
+	Protocol       string
 	IsRuSNI        bool
 	IsNoSNI        bool
 	IsReality      bool
@@ -54,7 +55,7 @@ type TargetService struct {
 	URL  string
 }
 
-// Список обязательных сервисов для полной проверки сквозной пропускной способности
+// Обязательные сервисы для проверки сквозного доступа
 var targetServices = []TargetService{
 	{Name: "Google", URL: "https://www.google.com/generate_204"},
 	{Name: "YouTube", URL: "https://www.youtube.com"},
@@ -75,45 +76,45 @@ var blockedSNIs = []string{
 	"t.me", "telegram.org", "cdninstagram.com", "medium.com",
 }
 
-// Список проверенных белых SNI РФ для работы в условия строгого белого списка ТСПУ
+// Белые SNI / Домены РФ для работы в условиях жестких белых списков ТСПУ
 var ruWhiteSNIs = []string{
 	"vk.com", "yandex.ru", "ya.ru", "vk.me", "ok.ru", "mail.ru",
 	"ozon.ru", "wildberries.ru", "gosuslugi.ru", "sberbank.ru",
 	"tbank.ru", "tinkoff.ru", "kinopoisk.ru", "avito.ru", "rutube.ru",
 	"rambler.ru", "hh.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru",
+	"mos.ru", "wb.ru", "open.ru", "vtb.ru", "alfabank.ru",
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	startTime := time.Now()
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	_ = rng
 
-	fmt.Println("=== [1/5] Инициализация окружения и Xray Core ===")
+	fmt.Println("=== [1/5] Инициализация высокоскоростного окружения и Xray Core ===")
 	ensureCoreAvailable()
 
 	sources, err := readLines("sources.txt")
 	if err != nil {
-		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые файлы.\n", err)
+		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые выходные файлы.\n", err)
 		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
 
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
-	fmt.Println("=== [2/5] Сбор и декодирование прокси-конфигураций ===")
+	fmt.Println("=== [2/5] Быстрый асинхронный сбор и декодирование прокси-конфигураций ===")
 
-	rawConfigs := make(chan string, 1000000)
+	rawConfigs := make(chan string, 2000000)
 	var wg sync.WaitGroup
 
-	// Высокопроизводительный HTTP клиент для параллельного скачивания подписок
+	// Оптимизированный HTTP клиент с пулом соединений
 	sharedHTTPClient := &http.Client{
-		Timeout: 12 * time.Second,
+		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:          2000,
-			MaxIdleConnsPerHost:   200,
-			IdleConnTimeout:       30 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
+			MaxIdleConns:          5000,
+			MaxIdleConnsPerHost:   500,
+			IdleConnTimeout:       45 * time.Second,
+			ResponseHeaderTimeout: 8 * time.Second,
 			DisableKeepAlives:     false,
 		},
 	}
@@ -138,19 +139,18 @@ func main() {
 	uniqueConfigs := make(map[string]bool)
 	for cfg := range rawConfigs {
 		cfg = strings.TrimSpace(cfg)
-		if cfg != "" {
+		if cfg != "" && len(cfg) < 4096 {
 			uniqueConfigs[cfg] = true
 		}
 	}
 
 	totalConfigs := len(uniqueConfigs)
-	fmt.Printf("Собрано %d уникальных валидных прокси-ссылок.\n", totalConfigs)
+	fmt.Printf("Собрано %d уникальных прокси-ссылок.\n", totalConfigs)
 	fmt.Println("=== [3/5] Запуск высокоскоростной ТСПУ & Service валидации ===")
 
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
-
 	var processedCount int64
 
 	for cfg := range uniqueConfigs {
@@ -165,15 +165,15 @@ func main() {
 			}
 
 			curr := atomic.AddInt64(&processedCount, 1)
-			if curr%200 == 0 || curr == int64(totalConfigs) {
-				fmt.Printf("Проверено: %d / %d\r", curr, totalConfigs)
+			if curr%500 == 0 || curr == int64(totalConfigs) {
+				fmt.Printf("Проверено узлов: %d / %d\r", curr, totalConfigs)
 			}
 		}(cfg)
 	}
 
 	testWg.Wait()
 	close(resultsChan)
-	fmt.Println("\nТестирование всех узлов завершено.")
+	fmt.Println("\nТестирование всех узлов полностью завершено.")
 
 	var validResults []ConfigResult
 	for res := range resultsChan {
@@ -182,9 +182,8 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Миксование и фильтрация результатов. Всего валидных: %d ===\n", len(validResults))
+	fmt.Printf("=== [4/5] Фильтрация и составление умного МИКСА (Валидных: %d) ===\n", len(validResults))
 
-	// Разделение валидных результатов по категориям
 	var ruSNIConfigs []ConfigResult
 	var noSNIConfigs []ConfigResult
 	var realityConfigs []ConfigResult
@@ -202,25 +201,26 @@ func main() {
 		}
 	}
 
-	// Сортировка каждой категории по качеству
-	sortByScoreAndServices := func(slice []ConfigResult) {
+	sortByScore := func(slice []ConfigResult) {
 		sort.Slice(slice, func(i, j int) bool {
 			if slice[i].ServiceSuccess == slice[j].ServiceSuccess {
+				if slice[i].Score == slice[j].Score {
+					return slice[i].Latency < slice[j].Latency
+				}
 				return slice[i].Score > slice[j].Score
 			}
 			return slice[i].ServiceSuccess > slice[j].ServiceSuccess
 		})
 	}
 
-	sortByScoreAndServices(ruSNIConfigs)
-	sortByScoreAndServices(noSNIConfigs)
-	sortByScoreAndServices(realityConfigs)
-	sortByScoreAndServices(otherConfigs)
+	sortByScore(ruSNIConfigs)
+	sortByScore(noSNIConfigs)
+	sortByScore(realityConfigs)
+	sortByScore(otherConfigs)
 
-	fmt.Printf("Найдено: [RU/Белые SNI: %d] | [Без SNI: %d] | [REALITY: %d] | [Остальные: %d]\n",
+	fmt.Printf("Категории выживаемости: [RU/White-SNI: %d] | [No-SNI: %d] | [REALITY: %d] | [Bypass: %d]\n",
 		len(ruSNIConfigs), len(noSNIConfigs), len(realityConfigs), len(otherConfigs))
 
-	// Формирование сбалансированного МИКСА до 300 конфигов
 	var selected []ConfigResult
 	usedMap := make(map[string]bool)
 
@@ -236,7 +236,7 @@ func main() {
 		return false
 	}
 
-	// 1. Приоритетный выбор для обхода 99% блокировок в РФ (RU SNI, NoSNI и REALITY)
+	// 1. Равномерное наполнение узлами с максимальным обходом ТСПУ (до 100 каждого типа)
 	targetPerCategory := maxOutputLimit / 3
 	for i := 0; i < targetPerCategory && i < len(ruSNIConfigs); i++ {
 		addUnique(ruSNIConfigs[i])
@@ -248,7 +248,7 @@ func main() {
 		addUnique(realityConfigs[i])
 	}
 
-	// 2. Если до 300 не добрали, дозаполняем белыми списками и обходными узлами
+	// 2. Заполнение оставшихся мест лучшими узлами из всех категорий
 	for _, res := range ruSNIConfigs {
 		addUnique(res)
 	}
@@ -258,8 +258,6 @@ func main() {
 	for _, res := range realityConfigs {
 		addUnique(res)
 	}
-
-	// 3. Если всё еще меньше 300, добираем из остальных лучших узлов
 	for _, res := range otherConfigs {
 		addUnique(res)
 	}
@@ -270,7 +268,7 @@ func main() {
 		if r.IsNoSNI {
 			tag = "NoSNI"
 		} else if r.IsRuSNI {
-			tag = "RU-SNI"
+			tag = "RU-White"
 		} else if r.IsReality {
 			tag = "REALITY"
 		} else {
@@ -281,16 +279,16 @@ func main() {
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-	fmt.Printf("Сформирован итоговый МИКС из %d конфигов.\n", len(finalSlice))
+	fmt.Printf("Сформирован итоговый МИКС из %d прокси-конфигураций.\n", len(finalSlice))
 
-	fmt.Println("=== [5/5] Запись выходных файлов для GitHub Actions ===")
+	fmt.Println("=== [5/5] Запись выходных файлов подписок ===")
 	rawOutput := strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
-	fmt.Printf("Успешно завершено за %v! Файлы output_raw.txt и output_base64.txt обновлены.\n", time.Since(startTime))
+	fmt.Printf("Процесс успешно завершен за %v! Файлы output_raw.txt и output_base64.txt готовы.\n", time.Since(startTime))
 }
 
 func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan<- string) {
@@ -298,7 +296,7 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -306,22 +304,19 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	}
 	defer resp.Body.Close()
 
-	// Ограничиваем считывание до 30 МБ для предотвращения переполнения ОЗУ
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 30*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
 	if err != nil {
 		return
 	}
 
 	content := string(body)
-	cleanedContent := cleanBase64String(content)
-
-	if decoded, err := decodeBase64Flex(cleanedContent); err == nil && len(decoded) > 0 {
+	if decoded, err := decodeBase64Flex(cleanBase64Fast(content)); err == nil && len(decoded) > 0 {
 		content = string(decoded)
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024)
+	scanner.Buffer(buf, 5*1024*1024)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -331,16 +326,16 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	}
 }
 
-func cleanBase64String(s string) string {
-	s = strings.ReplaceAll(s, "\r", "")
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, " ", "")
-	return strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '+' || r == '/' || r == '-' || r == '_' || r == '=' {
-			return r
+func cleanBase64Fast(s string) string {
+	var builder strings.Builder
+	builder.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '+' || b == '/' || b == '-' || b == '_' || b == '=' {
+			builder.WriteByte(b)
 		}
-		return -1
-	}, s)
+	}
+	return builder.String()
 }
 
 func decodeBase64Flex(s string) ([]byte, error) {
@@ -362,18 +357,19 @@ func decodeBase64Flex(s string) ([]byte, error) {
 }
 
 func isProxyProtocol(line string) bool {
-	protocols := []string{"vless://", "vmess://", "trojan://", "ss://", "ssr://", "hysteria2://", "hy2://", "tuic://"}
 	lower := strings.ToLower(line)
-	for _, p := range protocols {
-		if strings.HasPrefix(lower, p) {
-			return true
-		}
-	}
-	return false
+	return strings.HasPrefix(lower, "vless://") ||
+		strings.HasPrefix(lower, "vmess://") ||
+		strings.HasPrefix(lower, "trojan://") ||
+		strings.HasPrefix(lower, "ss://") ||
+		strings.HasPrefix(lower, "ssr://") ||
+		strings.HasPrefix(lower, "hysteria2://") ||
+		strings.HasPrefix(lower, "hy2://") ||
+		strings.HasPrefix(lower, "tuic://")
 }
 
 func testConfig(configStr string) (ConfigResult, bool) {
-	host, port, sni, path, transport := parseConfigDetails(configStr)
+	host, port, sni, path, transport, proto := parseConfigDetails(configStr)
 	if host == "" || port == "" {
 		return ConfigResult{}, false
 	}
@@ -384,7 +380,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	if StrictVLESSOnly && !strings.HasPrefix(lowerCfg, "vless://") {
+	if StrictVLESSOnly && proto != "vless" {
 		return ConfigResult{}, false
 	}
 
@@ -399,7 +395,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	targetAddr := net.JoinHostPort(host, port)
 	start := time.Now()
 
-	// 1. Быстрый TCP/TLS первично-агрессивный пинг
+	// 1. Быстрая проверка первичного TCP/TLS соединения
 	dialer := &net.Dialer{Timeout: timeout}
 	rawConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
@@ -412,7 +408,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	var conn net.Conn = rawConn
-	isTLS := strings.Contains(lowerCfg, "security=tls") || strings.Contains(lowerCfg, "security=reality") || strings.HasPrefix(lowerCfg, "trojan://")
+	isTLS := strings.Contains(lowerCfg, "security=tls") || strings.Contains(lowerCfg, "security=reality") || proto == "trojan"
 
 	if isTLS {
 		tlsConfig := &tls.Config{
@@ -438,7 +434,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 			return ConfigResult{}, false
 		}
 
-		buf := make([]byte, 1024)
+		buf := make([]byte, 512)
 		n, err := conn.Read(buf)
 		if err != nil || n == 0 {
 			_ = conn.Close()
@@ -455,17 +451,16 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	latency := time.Since(start)
 	_ = conn.Close()
 
-	// 2. Глубокий тест через Xray (для выживших узлов)
+	// 2. Тестирование прохождения трафика через локальный Xray
 	passedServices := checkTargetServicesViaProxy(configStr)
-
 	if passedServices == 0 {
 		return ConfigResult{}, false
 	}
 
 	isReality := strings.Contains(lowerCfg, "security=reality")
-	score := calculateBypassScore(configStr, port, sni, transport, latency, passedServices)
 	ruSNI := isRuSNI(sni)
 	noSNI := isNoSNI(sni, host)
+	score := calculateBypassScore(configStr, port, sni, transport, latency, passedServices)
 
 	return ConfigResult{
 		URL:            configStr,
@@ -473,6 +468,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		Score:          score,
 		ServiceSuccess: passedServices,
 		SNI:            sni,
+		Protocol:       proto,
 		IsRuSNI:        ruSNI,
 		IsNoSNI:        noSNI,
 		IsReality:      isReality,
@@ -485,12 +481,13 @@ func checkTargetServicesViaProxy(configStr string) int {
 		return 0
 	}
 
-	// Безопасное выделение порта без сокетных коллизий
-	listener, socksPort, err := getFreeTCPListener()
+	// Открытие сокета и прямое удержание порта для предотвращения Race Condition
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0
 	}
-	_ = listener.Close()
+	socksPort := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close() // Закрываем перед передачей в Xray
 
 	xrayConfigJSON, err := generateXrayConfig(configStr, socksPort)
 	if err != nil {
@@ -519,15 +516,14 @@ func checkTargetServicesViaProxy(configStr string) int {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	// Быстрая проверка Readiness SOCKS5 порта
-	for i := 0; i < 20; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 15*time.Millisecond)
+	for i := 0; i < 25; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 10*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(8 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -545,7 +541,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   serviceTimeout - (500 * time.Millisecond),
+		Timeout:   serviceTimeout - (400 * time.Millisecond),
 	}
 
 	var wg sync.WaitGroup
@@ -560,7 +556,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 			if err != nil {
 				return
 			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36")
 
 			resp, err := client.Do(req)
 			if err != nil {
@@ -579,41 +575,27 @@ func checkTargetServicesViaProxy(configStr string) int {
 }
 
 func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
-	u, err := url.Parse(configURL)
-	if err != nil {
-		return nil, err
+	host, portStr, sni, path, netType, outboundProtocol := parseConfigDetails(configURL)
+	if host == "" {
+		return nil, fmt.Errorf("invalid host")
 	}
 
-	host := u.Hostname()
-	portStr := u.Port()
-	if portStr == "" {
-		portStr = "443"
-	}
 	port, _ := strconv.Atoi(portStr)
+	if port == 0 {
+		port = 443
+	}
 
-	uuid := u.User.Username()
+	u, _ := url.Parse(configURL)
 	query := u.Query()
-
-	sni := query.Get("sni")
-	if sni == "" {
-		sni = query.Get("peer")
-	}
-	if sni == "" {
-		sni = host
-	}
+	uuid := u.User.Username()
 
 	security := query.Get("security")
 	if security == "" {
-		if strings.HasPrefix(configURL, "trojan://") {
+		if outboundProtocol == "trojan" {
 			security = "tls"
 		} else {
 			security = "none"
 		}
-	}
-
-	netType := query.Get("type")
-	if netType == "" {
-		netType = "tcp"
 	}
 
 	pbk := query.Get("pbk")
@@ -623,20 +605,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		fp = "chrome"
 	}
 
-	path := query.Get("path")
-	if path == "" {
-		path = "/"
-	}
 	flow := query.Get("flow")
-
-	outboundProtocol := "vless"
-	if strings.HasPrefix(configURL, "trojan://") {
-		outboundProtocol = "trojan"
-	} else if strings.HasPrefix(configURL, "vmess://") {
-		outboundProtocol = "vmess"
-	} else if strings.HasPrefix(configURL, "ss://") {
-		outboundProtocol = "shadowsocks"
-	}
 
 	streamSettings := map[string]interface{}{
 		"network":  netType,
@@ -702,7 +671,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 				},
 			},
 		}
-	} else {
+	} else { // vless / vmess
 		userSettings := map[string]interface{}{
 			"id":         uuid,
 			"encryption": "none",
@@ -748,18 +717,6 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	return json.Marshal(config)
 }
 
-func getFreeTCPListener() (net.Listener, int, error) {
-	for i := 0; i < 100; i++ {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err == nil {
-			port := l.Addr().(*net.TCPAddr).Port
-			return l, port, nil
-		}
-		time.Sleep(1 * time.Millisecond)
-	}
-	return nil, 0, fmt.Errorf("failed to allocate free port")
-}
-
 func findCoreExecutable() string {
 	if path, err := exec.LookPath("xray"); err == nil {
 		return path
@@ -803,7 +760,7 @@ func ensureCoreAvailable() {
 	}
 
 	if downloadURL == "" {
-		fmt.Println("Предупреждение: Неподдерживаемая архитектура для автозагрузки Xray.")
+		fmt.Println("Предупреждение: Неподдерживаемая ОС/архитектура для автоматической загрузки Xray.")
 		return
 	}
 
@@ -870,27 +827,25 @@ func ensureCoreAvailable() {
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int) int {
-	score := 100 + (passedServices * 50)
+	score := 100 + (passedServices * 60)
 	lower := strings.ToLower(configStr)
 
-	// Высокий приоритет Reality (устойчивость к ТСПУ)
 	if strings.Contains(lower, "security=reality") {
+		score += 250
+	}
+
+	if isRuSNI(sni) {
 		score += 200
 	}
 
-	// Начисление баллов за RU-SNI для белых списков
-	if isRuSNI(sni) {
-		score += 150
-	}
-
 	if transport == "grpc" {
-		score += 60
+		score += 80
 	} else if transport == "ws" {
-		score += 30
+		score += 40
 	}
 
 	pingMs := int(latency.Milliseconds())
-	score -= pingMs / 5
+	score -= pingMs / 4
 
 	return score
 }
@@ -914,7 +869,6 @@ func isRuSNI(sni string) bool {
 	}
 	sniLower := strings.ToLower(strings.TrimSpace(sni))
 
-	// Проверка на занесенные в белый список домены РФ
 	for _, ruDomain := range ruWhiteSNIs {
 		if strings.HasSuffix(sniLower, ruDomain) || sniLower == ruDomain {
 			return true
@@ -923,14 +877,6 @@ func isRuSNI(sni string) bool {
 
 	if strings.HasSuffix(sniLower, ".ru") || strings.HasSuffix(sniLower, ".su") || strings.HasSuffix(sniLower, ".xn--p1ai") || strings.HasSuffix(sniLower, ".рф") {
 		return true
-	}
-
-	parts := strings.Split(sniLower, ".")
-	if len(parts) > 1 {
-		tld := parts[len(parts)-1]
-		if tld == "ru" || tld == "su" || tld == "xn--p1ai" || tld == "рф" {
-			return true
-		}
 	}
 
 	return false
@@ -954,12 +900,34 @@ func setConfigName(configURL string, name string) string {
 	return configURL + "#" + escapedName
 }
 
-func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string) {
-	u, err := url.Parse(configStr)
-	if err != nil {
-		return "", "", "", "", ""
+func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string) {
+	if strings.HasPrefix(configStr, "vmess://") {
+		b64 := configStr[8:]
+		decoded, err := decodeBase64Flex(b64)
+		if err == nil {
+			var vmap map[string]interface{}
+			if err := json.Unmarshal(decoded, &vmap); err == nil {
+				host, _ = vmap["add"].(string)
+				if p, ok := vmap["port"]; ok {
+					port = fmt.Sprintf("%v", p)
+				}
+				sni, _ = vmap["sni"].(string)
+				if sni == "" {
+					sni, _ = vmap["host"].(string)
+				}
+				path, _ = vmap["path"].(string)
+				transport, _ = vmap["net"].(string)
+				return host, port, sni, path, strings.ToLower(transport), "vmess"
+			}
+		}
 	}
 
+	u, err := url.Parse(configStr)
+	if err != nil {
+		return "", "", "", "", "", ""
+	}
+
+	proto = strings.ToLower(u.Scheme)
 	host = u.Hostname()
 	port = u.Port()
 
@@ -984,7 +952,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 	}
 
 	if port == "" {
-		switch u.Scheme {
+		switch proto {
 		case "vless", "vmess", "trojan", "hysteria2", "hy2":
 			port = "443"
 		case "ss":
@@ -992,7 +960,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		}
 	}
 
-	return host, port, sni, path, transport
+	return host, port, sni, path, transport, proto
 }
 
 func readLines(path string) ([]string, error) {
