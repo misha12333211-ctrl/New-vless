@@ -5,18 +5,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -32,7 +33,7 @@ const (
 	maxConcurrency = 90  // Оптимально под 2 vCPU GitHub Actions
 	maxOutputLimit = 350 // Максимальное количество итоговых конфигов
 
-	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
+	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ (по умолчанию отключены) ---
 	StrictRuSNIOnly = false
 	StrictVLESSOnly = false
 	StrictPortsOnly = false
@@ -40,7 +41,6 @@ const (
 
 type ConfigResult struct {
 	URL            string
-	Key            string
 	Latency        time.Duration
 	Score          int
 	ServiceSuccess int
@@ -99,19 +99,8 @@ var ruWhiteSNIs = []string{
 	"rzd.ru", "aeroflot.ru", "nornickel.ru", "gazprom.ru", "rosneft.ru", "lukoil.ru", "habr.com", "3dnews.ru", "vk.ru",
 }
 
-var boundPortRegex = regexp.regexpCompile(`bound to (?:127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d+)`)
-
-func init() {
-	// Безопасное ограничение GOMAXPROCS без перегрузки контейнеров GitHub Actions
-	cpus := runtime.NumCPU()
-	if cpus > 4 {
-		runtime.GOMAXPROCS(4)
-	} else {
-		runtime.GOMAXPROCS(cpus)
-	}
-}
-
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	startTime := time.Now()
 
 	fmt.Println("=== [1/5] Инициализация высокоскоростного окружения и Xray Core ===")
@@ -163,20 +152,16 @@ func main() {
 		close(rawConfigs)
 	}()
 
-	// Дедупликация по уникальному ключу IP:Port:Protocol:UUID
-	uniqueConfigs := make(map[string]string)
+	uniqueConfigs := make(map[string]bool)
 	for cfg := range rawConfigs {
 		cfg = sanitizeProxyURL(cfg)
 		if cfg != "" && len(cfg) < 8192 && isProxyProtocol(cfg) {
-			key := getProxyKey(cfg)
-			if _, exists := uniqueConfigs[key]; !exists {
-				uniqueConfigs[key] = cfg
-			}
+			uniqueConfigs[cfg] = true
 		}
 	}
 
 	totalConfigs := len(uniqueConfigs)
-	fmt.Printf("Собрано %d уникальных уникальных прокси-ссылок (по IP:Port:Proto).\n", totalConfigs)
+	fmt.Printf("Собрано %d валидных уникальных прокси-ссылок.\n", totalConfigs)
 	fmt.Println("=== [3/5] Запуск валидации ТСПУ, Белых списков & 7 Сервисов ===")
 
 	resultsChan := make(chan ConfigResult, totalConfigs)
@@ -184,14 +169,14 @@ func main() {
 	var testWg sync.WaitGroup
 	var processedCount int64
 
-	for key, cfg := range uniqueConfigs {
+	for cfg := range uniqueConfigs {
 		testWg.Add(1)
-		go func(k, c string) {
+		go func(c string) {
 			defer testWg.Done()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			if res, ok := testConfig(k, c); ok {
+			if res, ok := testConfig(c); ok {
 				resultsChan <- res
 			}
 
@@ -199,7 +184,7 @@ func main() {
 			if curr%500 == 0 || curr == int64(totalConfigs) {
 				fmt.Printf("Проверено узлов: %d / %d\r", curr, totalConfigs)
 			}
-		}(key, cfg)
+		}(cfg)
 	}
 
 	testWg.Wait()
@@ -259,9 +244,9 @@ func main() {
 		if len(selected) >= maxOutputLimit {
 			return false
 		}
-		if !usedMap[item.Key] {
+		if !usedMap[item.URL] {
 			selected = append(selected, item)
-			usedMap[item.Key] = true
+			usedMap[item.URL] = true
 			return true
 		}
 		return false
@@ -273,7 +258,7 @@ func main() {
 		addUnique(ruSNIConfigs[i])
 	}
 
-	// 2. Добавление REALITY и No-SNI конфигураций
+	// 2. Добавление REALITY и No-SNI конфигураций (стойкие к ТСПУ)
 	for _, res := range realityConfigs {
 		if len(selected) >= maxOutputLimit {
 			break
@@ -314,25 +299,7 @@ func main() {
 	fmt.Printf("Процесс успешно завершен за %v! Файлы output_raw.txt и output_base64.txt готовы.\n", time.Since(startTime))
 }
 
-func getProxyKey(cfg string) string {
-	host, port, _, _, _, proto := parseConfigDetails(cfg)
-	if host == "" || port == "" {
-		return cfg
-	}
-
-	// Извлечение UUID для полной дедупликации
-	var uuid string
-	u, err := url.Parse(cfg)
-	if err == nil && u != nil {
-		if u.User != nil {
-			uuid = u.User.Username()
-		}
-	}
-
-	return fmt.Sprintf("%s:%s:%s:%s", strings.ToLower(host), port, proto, uuid)
-}
-
-func testConfig(key, configStr string) (ConfigResult, bool) {
+func testConfig(configStr string) (ConfigResult, bool) {
 	host, port, sni, _, transport, proto := parseConfigDetails(configStr)
 	if host == "" || port == "" {
 		return ConfigResult{}, false
@@ -359,7 +326,7 @@ func testConfig(key, configStr string) (ConfigResult, bool) {
 
 	start := time.Now()
 
-	// 2. Сквозное чтение и проверка через Xray Core с портом 0 (Dynamic Port)
+	// 2. Сквозное чтение и проверка через Xray Core
 	passedServices, mandatoryPassed := checkTargetServicesViaProxy(configStr)
 	if !mandatoryPassed {
 		return ConfigResult{}, false
@@ -377,7 +344,6 @@ func testConfig(key, configStr string) (ConfigResult, bool) {
 
 	return ConfigResult{
 		URL:            configStr,
-		Key:            key,
 		Latency:        latency,
 		Score:          score,
 		ServiceSuccess: passedServices,
@@ -394,6 +360,7 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	isReality := strings.Contains(lowerCfg, "security=reality") || strings.Contains(lowerCfg, "pbk=")
 	isTLS := strings.Contains(lowerCfg, "security=tls")
 
+	// Стандартные и мобильно-совместимые порты
 	validPorts := map[string]bool{
 		"80": true, "443": true, "8080": true, "8443": true, "2053": true, "2083": true, "2087": true, "2096": true, "4433": true, "8000": true, "8880": true,
 	}
@@ -402,10 +369,12 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 		return false
 	}
 
+	// Отсекаем голый Shadowsocks/SSR на нестандартных портах (блокируется DPI за 1 сек)
 	if (proto == "ss" || proto == "ssr") && !ruSNI && !isReality && !validPorts[port] {
 		return false
 	}
 
+	// Отсекаем заблокированные заграничные SNI при обычном TLS
 	if isTLS && !isReality && !ruSNI {
 		blockedSNIs := []string{
 			"cloudflare.com", "cloudfront.net", "facebook.com", "instagram.com",
@@ -421,14 +390,35 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	return true
 }
 
+func getFreeLocalPort() (int, error) {
+	for i := 0; i < 30; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(25000))
+		if err != nil {
+			continue
+		}
+		port := int(n.Int64()) + 20000
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		l, err := net.Listen("tcp", addr)
+		if err == nil {
+			_ = l.Close()
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no free port found")
+}
+
 func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	corePath := findCoreExecutable()
 	if corePath == "" {
 		return 0, false
 	}
 
-	// Формируем конфиг с портом 0 (Xray выделит системный порт сам без Race Condition)
-	xrayConfigJSON, err := generateXrayConfig(configStr, 0)
+	socksPort, err := getFreeLocalPort()
+	if err != nil {
+		return 0, false
+	}
+
+	xrayConfigJSON, err := generateXrayConfig(configStr, socksPort)
 	if err != nil {
 		return 0, false
 	}
@@ -439,14 +429,8 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	cmd := exec.CommandContext(ctx, corePath, "run", "-c", "stdin:")
 	cmd.Stdin = bytes.NewReader(xrayConfigJSON)
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return 0, false
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return 0, false
-	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
 		return 0, false
@@ -459,40 +443,10 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		}
 	}()
 
-	// Асинхронное считывание выделенного динамического порта
-	portChan := make(chan int, 1)
-	combinedReader := io.MultiReader(stdoutPipe, stderrPipe)
-
-	go func() {
-		scanner := bufio.NewScanner(combinedReader)
-		for scanner.Scan() {
-			text := scanner.Text()
-			matches := boundPortRegex.FindStringSubmatch(text)
-			if len(matches) > 1 {
-				if port, err := strconv.Atoi(matches[1]); err == nil && port > 0 {
-					select {
-					case portChan <- port:
-					default:
-					}
-					return
-				}
-			}
-		}
-	}()
-
-	var socksPort int
-	select {
-	case socksPort = <-portChan:
-	case <-time.After(1500 * time.Millisecond):
-		return 0, false
-	case <-ctx.Done():
-		return 0, false
-	}
-
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 80; i++ {
 		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
@@ -684,30 +638,6 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	var outboundSettings map[string]interface{}
 
 	switch outboundProtocol {
-	case "hysteria2", "hy2":
-		outboundProtocol = "hysteria2"
-		outboundSettings = map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{
-					"address":           host,
-					"port":              port,
-					"password":          uuid,
-					"congestion_control": "bbr",
-				},
-			},
-		}
-	case "tuic":
-		outboundProtocol = "tuic"
-		outboundSettings = map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{
-					"address":  host,
-					"port":     port,
-					"uuid":     uuid,
-					"password": query.Get("pass"),
-				},
-			},
-		}
 	case "trojan":
 		outboundSettings = map[string]interface{}{
 			"servers": []map[string]interface{}{
@@ -775,12 +705,12 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 
 	config := map[string]interface{}{
 		"log": map[string]interface{}{
-			"loglevel": "warning",
+			"loglevel": "none",
 		},
 		"inbounds": []map[string]interface{}{
 			{
 				"listen":   "127.0.0.1",
-				"port":     socksPort, // Если передан 0, Xray выберет любой свободный порт
+				"port":     socksPort,
 				"protocol": "socks",
 				"settings": map[string]interface{}{
 					"auth": "noauth",
@@ -1020,34 +950,28 @@ func isProxyProtocol(line string) bool {
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int) int {
-	score := 100 + (passedServices * 100)
+	score := 100 + (passedServices * 80)
 	lower := strings.ToLower(configStr)
 
-	// Высочайший приоритет RU SNI (обход белых списков ТСПУ)
+	// Высочайший приоритет конфигурациям с RU SNI (обход белых списков)
 	if isRuSNI(sni) {
-		score += 500
+		score += 400
 	}
 
 	// Стойкость к ТСПУ через REALITY
 	if strings.Contains(lower, "security=reality") || strings.Contains(lower, "pbk=") {
-		score += 450
+		score += 350
 	}
 
-	// Порты 443/80 почти не вызывают подозрений
-	if port == "443" || port == "80" {
-		score += 80
-	}
-
-	// Высокая скорость/стабильность на мобильных сетях
+	// Высокая скорость/стабильность на мобильных сетях (gRPC / WS)
 	if transport == "grpc" {
 		score += 100
 	} else if transport == "ws" {
 		score += 60
 	}
 
-	// Штраф за высокий пинг
 	pingMs := int(latency.Milliseconds())
-	score -= pingMs / 3
+	score -= pingMs / 2
 
 	return score
 }
