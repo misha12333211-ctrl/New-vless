@@ -28,10 +28,10 @@ import (
 )
 
 const (
-	timeout        = 1200 * time.Millisecond
-	serviceTimeout = 3800 * time.Millisecond
-	maxConcurrency = 180
-	maxOutputLimit = 350
+	timeout        = 1000 * time.Millisecond
+	serviceTimeout = 2500 * time.Millisecond
+	maxConcurrency = 250
+	maxOutputLimit = 400
 
 	// --- НАСТРОЙКИ ЖЕСТКОЙ ФИЛЬТРАЦИИ ---
 	StrictRuSNIOnly = false
@@ -50,6 +50,7 @@ type ConfigResult struct {
 	IsRuSNI        bool
 	IsNoSNI        bool
 	IsReality      bool
+	IsHysteria     bool
 }
 
 type TargetService struct {
@@ -74,25 +75,25 @@ var targetServices = []TargetService{
 	{Name: "DeepSeek", URL: "https://chat.deepseek.com"},
 }
 
-// Расширенный белый список SNI и инфраструктурных доменов для гарантированного прохождения проверки ТСПУ
+// Расширенный белый список SNI и инфраструктурных доменов для гарантированного прохождения ТСПУ (Белые списки РФ)
 var ruWhiteSNIs = []string{
 	// Государственные ресурсы и инфраструктура
-	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "cbr.ru", "kremlin.ru",
+	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "cbr.ru", "kremlin.ru", "customs.gov.ru", "pensionpobeda.ru",
 	// Крупнейшие порталы, экосистемы и поисковики
-	"yandex.ru", "ya.ru", "dzen.ru", "yastatic.net", "yandex.net",
-	"vk.com", "vk.me", "vk-portal.net", "cdn.vk.com", "ok.ru", "mail.ru", "rambler.ru",
+	"yandex.ru", "ya.ru", "dzen.ru", "yastatic.net", "yandex.net", "yandex.org",
+	"vk.com", "vk.me", "vk-portal.net", "cdn.vk.com", "ok.ru", "mail.ru", "rambler.ru", "my.games",
 	// Банки и финансовый сектор
-	"sberbank.ru", "tbank.ru", "tinkoff.ru", "vtb.ru", "alfabank.ru", "open.ru", "mirconnect.ru",
-	// Маркетплейсы и ритейл
-	"ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "ecom.ozon.ru",
-	// Медиа, видеохостинги и операторы
+	"sberbank.ru", "tbank.ru", "tinkoff.ru", "vtb.ru", "alfabank.ru", "open.ru", "mirconnect.ru", "sber.ru", "gazprombank.ru",
+	// Маркетплейсы, сервисы и ритейл
+	"ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "ecom.ozon.ru", "lamoda.ru", "mvideo.ru", "dns-shop.ru",
+	// Медиа, видеохостинги, связь и провайдеры
 	"kinopoisk.ru", "rutube.ru", "hh.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru",
-	"rt.ru", "megafon.ru", "beeline.ru", "mts.ru", "nornickel.ru", "maxima.ru",
+	"rt.ru", "megafon.ru", "beeline.ru", "mts.ru", "nornickel.ru", "maxima.ru", "tele2.ru", "domru.ru",
 }
 
 // Заблокированные или жестко фильтруемые зарубежные SNI
 var blockedGlobalSNIs = []string{
-	"cloudflare.com", "cloudfront.net", "google.com", "facebook.com",
+	"cloudflare.com", "cloudfront.net", "facebook.com",
 	"discord.gg", "discord.com", "twitter.com", "x.com", "instagram.com",
 }
 
@@ -114,17 +115,17 @@ func main() {
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
 	fmt.Println("=== [2/5] Быстрый асинхронный сбор и декодирование прокси-конфигураций ===")
 
-	rawConfigs := make(chan string, 3000000)
+	rawConfigs := make(chan string, 3500000)
 	var wg sync.WaitGroup
 
 	sharedHTTPClient := &http.Client{
-		Timeout: 7 * time.Second,
+		Timeout: 6 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:          20000,
-			MaxIdleConnsPerHost:   2000,
-			IdleConnTimeout:       30 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
+			MaxIdleConns:          30000,
+			MaxIdleConnsPerHost:   3000,
+			IdleConnTimeout:       45 * time.Second,
+			ResponseHeaderTimeout: 4 * time.Second,
 			DisableKeepAlives:     false,
 		},
 	}
@@ -196,11 +197,12 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Балансировка подписки (>55%% RU SNI) (Валидных: %d) ===\n", len(validResults))
+	fmt.Printf("=== [4/5] Балансировка подписки (>55%% RU SNI/Bypass) (Валидных: %d) ===\n", len(validResults))
 
 	var ruSNIConfigs []ConfigResult
 	var noSNIConfigs []ConfigResult
 	var realityConfigs []ConfigResult
+	var hysteriaConfigs []ConfigResult
 	var otherConfigs []ConfigResult
 
 	for _, res := range validResults {
@@ -208,6 +210,8 @@ func main() {
 			ruSNIConfigs = append(ruSNIConfigs, res)
 		} else if res.IsReality {
 			realityConfigs = append(realityConfigs, res)
+		} else if res.IsHysteria {
+			hysteriaConfigs = append(hysteriaConfigs, res)
 		} else if res.IsNoSNI {
 			noSNIConfigs = append(noSNIConfigs, res)
 		} else {
@@ -229,11 +233,12 @@ func main() {
 
 	sortByScore(ruSNIConfigs)
 	sortByScore(realityConfigs)
+	sortByScore(hysteriaConfigs)
 	sortByScore(noSNIConfigs)
 	sortByScore(otherConfigs)
 
-	fmt.Printf("Доступно по категориям: [RU SNI: %d] | [REALITY: %d] | [No-SNI: %d] | [Прочие: %d]\n",
-		len(ruSNIConfigs), len(realityConfigs), len(noSNIConfigs), len(otherConfigs))
+	fmt.Printf("Доступно по категориям: [RU SNI: %d] | [REALITY: %d] | [HYSTERIA2/TUIC: %d] | [No-SNI: %d] | [Прочие: %d]\n",
+		len(ruSNIConfigs), len(realityConfigs), len(hysteriaConfigs), len(noSNIConfigs), len(otherConfigs))
 
 	var selected []ConfigResult
 	usedMap := make(map[string]bool)
@@ -258,13 +263,16 @@ func main() {
 	}
 
 	remainingQuota := maxOutputLimit - len(selected)
-	perOtherCategory := remainingQuota / 3
+	perOtherCategory := remainingQuota / 4
 	if perOtherCategory < 1 {
 		perOtherCategory = 1
 	}
 
 	for i := 0; i < perOtherCategory && i < len(realityConfigs); i++ {
 		addUnique(realityConfigs[i])
+	}
+	for i := 0; i < perOtherCategory && i < len(hysteriaConfigs); i++ {
+		addUnique(hysteriaConfigs[i])
 	}
 	for i := 0; i < perOtherCategory && i < len(noSNIConfigs); i++ {
 		addUnique(noSNIConfigs[i])
@@ -273,10 +281,14 @@ func main() {
 		addUnique(otherConfigs[i])
 	}
 
+	// Добираем остатки до предела
 	for _, res := range ruSNIConfigs {
 		addUnique(res)
 	}
 	for _, res := range realityConfigs {
+		addUnique(res)
+	}
+	for _, res := range hysteriaConfigs {
 		addUnique(res)
 	}
 	for _, res := range noSNIConfigs {
@@ -288,7 +300,8 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		renamedURL := setConfigName(r.URL, fmt.Sprintf("Sub %d", i+1))
+		tag := fmt.Sprintf("🛡️ RU-Bypass %d [%s]", i+1, strings.ToUpper(r.Protocol))
+		renamedURL := setConfigName(r.URL, tag)
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
@@ -312,7 +325,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	lowerCfg := strings.ToLower(configStr)
 
-	if StrictPortsOnly && port != "443" && port != "80" && port != "8443" && port != "2053" && port != "2083" {
+	if StrictPortsOnly && port != "443" && port != "80" && port != "8443" && port != "2053" && port != "2083" && port != "2096" {
 		return ConfigResult{}, false
 	}
 
@@ -351,6 +364,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		tlsConfig := &tls.Config{
 			ServerName:         serverName,
 			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2", "http/1.1"},
 		}
 		tlsConn := tls.Client(rawConn, tlsConfig)
 		_ = tlsConn.SetDeadline(time.Now().Add(timeout))
@@ -395,6 +409,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	isReality := strings.Contains(lowerCfg, "security=reality")
+	isHysteria := proto == "hysteria2" || proto == "hy2" || proto == "tuic"
 	ruSNI := isRuSNI(sni)
 	noSNI := isNoSNI(sni, host)
 	score := calculateBypassScore(configStr, port, sni, transport, latency, passedServices)
@@ -410,22 +425,21 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		IsRuSNI:        ruSNI,
 		IsNoSNI:        noSNI,
 		IsReality:      isReality,
+		IsHysteria:     isHysteria,
 	}, true
 }
 
-// Эмуляция алгоритмов ТСПУ
 func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	ruSNI := isRuSNI(sni)
 	isReality := strings.Contains(lowerCfg, "security=reality")
 	isTLS := strings.Contains(lowerCfg, "security=tls")
 
 	// 1. Фильтрация открытых протоколов без TLS на нестандартных портах
-	// ТСПУ анализирует незашифрованный трафик и активнее блокирует нетипичные порты.
 	if !isTLS && !isReality && port != "80" && port != "8080" && port != "8880" && port != "2052" && port != "2082" && port != "2086" && port != "2095" {
 		return false
 	}
 
-	// 2. Блокировка незашифрованных или легко определяемых протоколов (Shadowsocks/SSR без плагинов маскировки)
+	// 2. Блокировка незашифрованных или легко определяемых протоколов (Shadowsocks/SSR без плагинов)
 	if proto == "ss" || proto == "ssr" {
 		if !ruSNI && !isReality && !strings.Contains(lowerCfg, "plugin=") {
 			return false
@@ -433,18 +447,14 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	}
 
 	// 3. Проверка белых / черных списков SNI для стандартного TLS
-	// Если используется обычный TLS (не Reality), SNI проверяется по правилам белого списка.
 	if isTLS && !isReality {
-		// Блокировка явных зарубежных SNI из черного списка
 		for _, b := range blockedGlobalSNIs {
 			if strings.Contains(sni, b) {
 				return false
 			}
 		}
 
-		// Если SNI указан, но не входит в разрешенную RU-зону / белый список, шанс блокировки ТСПУ высокий
 		if sni != "" && !ruSNI {
-			// Допускаем только IP в качестве host или разрешенные белые домены
 			if net.ParseIP(sni) == nil {
 				return false
 			}
@@ -482,6 +492,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
+	// Гарантированное завершение и очистка фонового процесса
 	defer func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
@@ -492,14 +503,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	for i := 0; i < 30; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 8*time.Millisecond)
+	for i := 0; i < 25; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 6*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(6 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -513,12 +524,12 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 			InsecureSkipVerify: true,
 		},
 		DisableKeepAlives:   true,
-		MaxIdleConnsPerHost: 20,
+		MaxIdleConnsPerHost: 25,
 	}
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   serviceTimeout - (400 * time.Millisecond),
+		Timeout:   serviceTimeout - (300 * time.Millisecond),
 	}
 
 	var wg sync.WaitGroup
@@ -656,7 +667,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 				},
 			},
 		}
-	case "shadowsocks":
+	case "shadowsocks", "ss":
 		userPass := u.User.String()
 		method := "aes-128-gcm"
 		password := userPass
@@ -934,15 +945,19 @@ func isProxyProtocol(line string) bool {
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int) int {
-	score := 100 + (passedServices * 70)
+	score := 100 + (passedServices * 80)
 	lower := strings.ToLower(configStr)
 
 	if strings.Contains(lower, "security=reality") {
-		score += 300
+		score += 350
 	}
 
 	if isRuSNI(sni) {
-		score += 250
+		score += 300
+	}
+
+	if strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://") || strings.HasPrefix(lower, "tuic://") {
+		score += 200
 	}
 
 	if transport == "grpc" {
@@ -957,7 +972,6 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 	return score
 }
 
-// Улучшенная проверка на принадлежность к белым RU-доменам
 func isRuSNI(sni string) bool {
 	if sni == "" {
 		return false
@@ -1022,6 +1036,8 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 						port = fmt.Sprintf("%.0f", v)
 					case string:
 						port = v
+					case json.Number:
+						port = v.String()
 					default:
 						port = fmt.Sprintf("%v", v)
 					}
