@@ -26,10 +26,10 @@ import (
 )
 
 const (
-	timeout        = 1800 * time.Millisecond
-	serviceTimeout = 5000 * time.Millisecond
-	maxConcurrency = 120 // Оптимальная параллельность для 2 vCPU GitHub Runner
-	maxOutputLimit = 300 // Итоговый лимит топовых конфигов
+	timeout        = 1500 * time.Millisecond
+	serviceTimeout = 4000 * time.Millisecond
+	maxConcurrency = 160 // Оптимизировано под GitHub Actions Runner (2 vCPU / Go Runtime GOMAXPROCS)
+	maxOutputLimit = 300 // Максимальное количество итоговых конфигов
 
 	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
 	StrictRuSNIOnly = false
@@ -75,13 +75,14 @@ var blockedSNIs = []string{
 	"t.me", "telegram.org", "cdninstagram.com", "medium.com",
 }
 
-// Белые SNI / Домены РФ для работы в условиях жестких белых списков ТСПУ
+// Расширенные белые SNI / Домены РФ для работы в условиях жестких белых списков ТСПУ (до 99% доступности)
 var ruWhiteSNIs = []string{
 	"vk.com", "yandex.ru", "ya.ru", "vk.me", "ok.ru", "mail.ru",
 	"ozon.ru", "wildberries.ru", "gosuslugi.ru", "sberbank.ru",
 	"tbank.ru", "tinkoff.ru", "kinopoisk.ru", "avito.ru", "rutube.ru",
 	"rambler.ru", "hh.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru",
-	"mos.ru", "wb.ru", "open.ru", "vtb.ru", "alfabank.ru",
+	"mos.ru", "wb.ru", "open.ru", "vtb.ru", "alfabank.ru", "nalog.gov.ru",
+	"rt.ru", "megafon.ru", "beeline.ru", "mts.ru", "nornickel.ru",
 }
 
 func main() {
@@ -102,18 +103,18 @@ func main() {
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
 	fmt.Println("=== [2/5] Быстрый асинхронный сбор и декодирование прокси-конфигураций ===")
 
-	rawConfigs := make(chan string, 2000000)
+	rawConfigs := make(chan string, 2500000)
 	var wg sync.WaitGroup
 
-	// Оптимизированный HTTP клиент с пулом соединений
+	// Высокопроизводительный HTTP клиент с настройками Keep-Alive
 	sharedHTTPClient := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 8 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:          5000,
-			MaxIdleConnsPerHost:   500,
-			IdleConnTimeout:       45 * time.Second,
-			ResponseHeaderTimeout: 8 * time.Second,
+			MaxIdleConns:          10000,
+			MaxIdleConnsPerHost:   1000,
+			IdleConnTimeout:       30 * time.Second,
+			ResponseHeaderTimeout: 6 * time.Second,
 			DisableKeepAlives:     false,
 		},
 	}
@@ -235,7 +236,7 @@ func main() {
 		return false
 	}
 
-	// 1. Равномерное наполнение узлами с максимальным обходом ТСПУ (до 100 каждого типа)
+	// 1. Равномерное наполнение узлами с максимальным обходом ТСПУ
 	targetPerCategory := maxOutputLimit / 3
 	for i := 0; i < targetPerCategory && i < len(ruSNIConfigs); i++ {
 		addUnique(ruSNIConfigs[i])
@@ -263,18 +264,8 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		var tag string
-		if r.IsNoSNI {
-			tag = "NoSNI"
-		} else if r.IsRuSNI {
-			tag = "RU-White"
-		} else if r.IsReality {
-			tag = "REALITY"
-		} else {
-			tag = "Bypass"
-		}
-
-		renamedURL := setConfigName(r.URL, fmt.Sprintf("[%s] Node-%d | %dms", tag, i+1, r.Latency.Milliseconds()))
+		// Переименование в простую последовательность: Sub 1, Sub 2, Sub 3...
+		renamedURL := setConfigName(r.URL, fmt.Sprintf("Sub %d", i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
@@ -394,7 +385,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	targetAddr := net.JoinHostPort(host, port)
 	start := time.Now()
 
-	// 1. Быстрая проверка первичного TCP/TLS соединения
+	// 1. Первичная проверка прямого сокета (TCP/TLS handshake)
 	dialer := &net.Dialer{Timeout: timeout}
 	rawConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
@@ -480,13 +471,13 @@ func checkTargetServicesViaProxy(configStr string) int {
 		return 0
 	}
 
-	// Открытие сокета и прямое удержание порта для предотвращения Race Condition
+	// Выделение свободного TCP порта
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0
 	}
 	socksPort := listener.Addr().(*net.TCPAddr).Port
-	_ = listener.Close() // Закрываем перед передачей в Xray
+	_ = listener.Close()
 
 	xrayConfigJSON, err := generateXrayConfig(configStr, socksPort)
 	if err != nil {
@@ -505,6 +496,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 		return 0
 	}
 
+	// Гарантированная очистка Xray процесса после тестирования
 	defer func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
@@ -540,7 +532,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   serviceTimeout - (400 * time.Millisecond),
+		Timeout:   serviceTimeout - (300 * time.Millisecond),
 	}
 
 	var wg sync.WaitGroup
