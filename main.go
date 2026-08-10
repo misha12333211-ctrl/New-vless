@@ -28,12 +28,15 @@ import (
 )
 
 const (
-	timeout        = 3500 * time.Millisecond
-	serviceTimeout = 9500 * time.Millisecond
-	maxConcurrency = 80  // Оптимизировано под 2 vCPU GitHub Actions
-	maxOutputLimit = 350 // Максимальное количество итоговых конфигов
+	// Жесткий тайм-аут для проверки низкого пинга (50-70 мс на симке)
+	timeout        = 2000 * time.Millisecond
+	serviceTimeout = 6000 * time.Millisecond
+	maxConcurrency = 100 // Максимальный параллелизм для быстрого отсева
+	maxOutputLimit = 300 // Оптимальный объем подписки
 
-	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ (по умолчанию отключены) ---
+	// Максимально допустимый пинг из Runner (Европа), чтобы на симке в РФ было ~50-70 мс
+	maxAllowedRunnerLatency = 45 * time.Millisecond
+
 	StrictRuSNIOnly = false
 	StrictVLESSOnly = false
 	StrictPortsOnly = false
@@ -74,7 +77,7 @@ var targetServices = []TargetService{
 	{Name: "DeepSeek", URL: "https://chat.deepseek.com"},
 }
 
-// РАСШИРЕННЫЙ СПИСОК РОССИЙСКИХ SNI И БЕЛЫХ ДОМЕНОВ (ТСПУ / Белые списки 2026)
+// Расширенный список белых SNI для обхода ТСПУ 2026
 var ruWhiteSNIs = []string{
 	// Экосистема VK & Mail.ru
 	"vk.com", "vk.me", "m.vk.com", "userapi.com", "vk-cdn.net", "mail.ru", "ok.ru", "my.games", "vkplay.ru", "vkcompany.ru",
@@ -90,13 +93,8 @@ var ruWhiteSNIs = []string{
 	"citilink.ru", "mvideo.ru", "eldorado.ru", "lamoda.ru", "sbermarket.ru", "vprok.ru", "magnit.ru", "5ka.ru",
 	// Телеком и Операторы
 	"mts.ru", "megafon.ru", "beeline.ru", "tele2.ru", "rt.ru", "rostelecom.ru", "yota.ru", "ttk.ru",
-	// Поиск работы и образование
-	"hh.ru", "superjob.ru", "rabota.ru", "stepik.org", "geekbrains.ru", "skillbox.ru", "ya.praktikum.ru",
-	// СМИ, Порталы и Видео
-	"rutube.ru", "rambler.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru", "kommersant.ru", "tass.ru",
-	"iz.ru", "vedomosti.ru", "rg.ru", "dzen.ru", "smotrim.ru", "1tv.ru", "ntv.ru", "matchtv.ru",
-	// Промышленность, Транспорт и ИТ
-	"rzd.ru", "aeroflot.ru", "nornickel.ru", "gazprom.ru", "rosneft.ru", "lukoil.ru", "habr.com", "3dnews.ru", "vk.ru",
+	// Поиск работы, ИТ и медиа
+	"hh.ru", "superjob.ru", "rabota.ru", "habr.com", "3dnews.ru", "rutube.ru", "rbc.ru", "ria.ru", "lenta.ru",
 }
 
 func main() {
@@ -124,14 +122,14 @@ func main() {
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 		MaxIdleConns:          10000,
 		MaxIdleConnsPerHost:   1000,
-		IdleConnTimeout:       45 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
 		DisableKeepAlives:     false,
 	}
 	defer tr.CloseIdleConnections()
 
 	sharedHTTPClient := &http.Client{
-		Timeout:   18 * time.Second,
+		Timeout:   12 * time.Second,
 		Transport: tr,
 	}
 
@@ -162,7 +160,7 @@ func main() {
 
 	totalConfigs := len(uniqueConfigs)
 	fmt.Printf("Собрано %d валидных уникальных прокси-ссылок.\n", totalConfigs)
-	fmt.Println("=== [3/5] Запуск валидации ТСПУ, Белых списков & 7 Сервисов ===")
+	fmt.Println("=== [3/5] Запуск фильтрации низкого пинга (50-70мс) и валидации ТСПУ ===")
 
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
@@ -198,11 +196,11 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Балансировка подписки (КВОТА RU SNI ~80%%) (Валидных: %d) ===\n", len(validResults))
+	fmt.Printf("=== [4/5] Балансировка подписки (КВОТА RU SNI / REALITY ~85%%) (Валидных: %d) ===\n", len(validResults))
 
 	var ruSNIConfigs []ConfigResult
-	var noSNIConfigs []ConfigResult
 	var realityConfigs []ConfigResult
+	var noSNIConfigs []ConfigResult
 	var otherConfigs []ConfigResult
 
 	for _, res := range validResults {
@@ -234,7 +232,7 @@ func main() {
 	sortByScore(noSNIConfigs)
 	sortByScore(otherConfigs)
 
-	fmt.Printf("Доступно по категориям: [RU SNI: %d] | [REALITY: %d] | [No-SNI: %d] | [Прочие: %d]\n",
+	fmt.Printf("Доступно низколатентных узлов: [RU SNI: %d] | [REALITY: %d] | [No-SNI: %d] | [Прочие: %d]\n",
 		len(ruSNIConfigs), len(realityConfigs), len(noSNIConfigs), len(otherConfigs))
 
 	var selected []ConfigResult
@@ -252,29 +250,25 @@ func main() {
 		return false
 	}
 
-	// 1. КВОТА RU SNI = 80% (до 280 конфигов)
-	ruTargetQuota := (maxOutputLimit * 80) / 100
+	// 1. Формирование приоритетного пула для белых списков РФ (RU SNI + REALITY)
+	ruTargetQuota := (maxOutputLimit * 85) / 100
+
 	for i := 0; i < len(ruSNIConfigs) && len(selected) < ruTargetQuota; i++ {
 		addUnique(ruSNIConfigs[i])
 	}
 
-	// 2. Добавление REALITY и No-SNI конфигураций
-	for _, res := range realityConfigs {
-		if len(selected) >= maxOutputLimit {
-			break
-		}
-		addUnique(res)
+	for i := 0; i < len(realityConfigs) && len(selected) < ruTargetQuota; i++ {
+		addUnique(realityConfigs[i])
 	}
 
+	// 2. Заполнение оставшихся мест No-SNI и качественными резервами
 	for _, res := range noSNIConfigs {
-		if len(selected) >= maxOutputLimit {
-			break
-		}
 		addUnique(res)
 	}
-
-	// 3. Дозаполнение до максимума лучшими из всех оставшихся
 	for _, res := range ruSNIConfigs {
+		addUnique(res)
+	}
+	for _, res := range realityConfigs {
 		addUnique(res)
 	}
 	for _, res := range otherConfigs {
@@ -283,7 +277,14 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-Bypass-RU-%d", i+1))
+		// Пометка типа конфига для удобства в клиенте
+		tag := "RU-Bypass"
+		if r.IsReality {
+			tag = "REALITY-Fast"
+		} else if r.IsRuSNI {
+			tag = "WhiteSNI-Fast"
+		}
+		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-%s-%d", tag, i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
@@ -296,7 +297,7 @@ func main() {
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
-	fmt.Printf("Процесс успешно завершен за %v! Файлы output_raw.txt и output_base64.txt готовы.\n", time.Since(startTime))
+	fmt.Printf("Процесс успешно завершен за %v! Файлы ready.\n", time.Since(startTime))
 }
 
 func testConfig(configStr string) (ConfigResult, bool) {
@@ -306,6 +307,11 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	lowerCfg := strings.ToLower(configStr)
+
+	// Отсекаем устаревшие протоколы, легко блокируемые ТСПУ на мобильных операторах
+	if proto == "ssr" {
+		return ConfigResult{}, false
+	}
 
 	if StrictPortsOnly && port != "443" && port != "80" && port != "8443" && port != "2053" && port != "2083" && port != "2087" && port != "2096" {
 		return ConfigResult{}, false
@@ -319,20 +325,26 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	// 1. Предварительная фильтрация по правилам обхода ТСПУ
+	// 1. Предварительная проверка совместимости с белыми списками
 	if !simulateTSPUBypassCheck(proto, port, sni, lowerCfg) {
 		return ConfigResult{}, false
 	}
 
 	start := time.Now()
 
-	// 2. Сквозное чтение и проверка через Xray Core
+	// 2. Проверка через Xray Core
 	passedServices, mandatoryPassed := checkTargetServicesViaProxy(configStr)
 	if !mandatoryPassed {
 		return ConfigResult{}, false
 	}
 
 	latency := time.Since(start)
+
+	// Отбрасываем узлы с высоким пингом из Runner, чтобы на мобильной симке было не выше ~50-70мс
+	if latency > maxAllowedRunnerLatency {
+		return ConfigResult{}, false
+	}
+
 	isReality := strings.Contains(lowerCfg, "security=reality") || strings.Contains(lowerCfg, "pbk=")
 	ruSNI := isRuSNI(sni)
 	noSNI := isNoSNI(sni, host)
@@ -356,25 +368,25 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	isReality := strings.Contains(lowerCfg, "security=reality") || strings.Contains(lowerCfg, "pbk=")
 	isTLS := strings.Contains(lowerCfg, "security=tls")
 
-	// Разрешаем порты для обхода сетевых фильтров
+	// Разрешаем порты, проходящие фильтрацию
 	validPorts := map[string]bool{
-		"80": true, "443": true, "8080": true, "8443": true, "2053": true, "2083": true, "2087": true, "2096": true, "4433": true, "8000": true, "8880": true,
+		"80": true, "443": true, "8080": true, "8443": true, "2053": true, "2083": true, "2087": true, "2096": true, "4433": true,
 	}
 
 	if !isTLS && !isReality && !validPorts[port] {
 		return false
 	}
 
-	// Отсекаем старые Shadowsocks без обертки
-	if (proto == "ss" || proto == "ssr") && !ruSNI && !isReality && !validPorts[port] {
+	// Отсекаем открытый Shadowsocks без маскировки
+	if (proto == "ss" || proto == "shadowsocks") && !ruSNI && !isReality && !validPorts[port] {
 		return false
 	}
 
-	// Отсекаем заблокированные заграничные SNI при обычном TLS
+	// Фильтрация заблокированных зарубежных SNI
 	if isTLS && !isReality && !ruSNI {
 		blockedSNIs := []string{
 			"cloudflare.com", "cloudfront.net", "facebook.com", "instagram.com",
-			"twitter.com", "netflix.com", "medium.com", "bbc.com",
+			"twitter.com", "netflix.com", "medium.com", "bbc.com", "discord.com",
 		}
 		for _, b := range blockedSNIs {
 			if strings.Contains(sni, b) {
@@ -387,7 +399,6 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 }
 
 func getFreeLocalPort() (int, error) {
-	// Безопасный подбор свободного порта в диапазоне 20000-45000
 	for i := 0; i < 30; i++ {
 		n, err := rand.Int(rand.Reader, big.NewInt(25000))
 		if err != nil {
@@ -433,7 +444,6 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
-	// Гарантированное завершение процесса Xray по выходу
 	defer func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
@@ -444,14 +454,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	for i := 0; i < 80; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
+	for i := 0; i < 60; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -470,7 +480,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   serviceTimeout - (1000 * time.Millisecond),
+		Timeout:   3000 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
@@ -487,14 +497,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		go func(s TargetService) {
 			defer wg.Done()
 
-			reqCtx, reqCancel := context.WithTimeout(ctx, 4500*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 2800*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
 			if err != nil {
 				return
 			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36")
 
 			resp, err := client.Do(req)
 			if err != nil {
@@ -681,7 +691,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 				},
 			},
 		}
-	default: // vless & compatibility
+	default: // vless
 		outboundProtocol = "vless"
 		userSettings := map[string]interface{}{
 			"id":         uuid,
@@ -885,7 +895,7 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 		}
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(content))
+	scanner := bufio.NewScanner(strings.Reader(content))
 	buf := make([]byte, 128*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 
@@ -941,32 +951,35 @@ func isProxyProtocol(line string) bool {
 		strings.HasPrefix(lower, "vmess://") ||
 		strings.HasPrefix(lower, "trojan://") ||
 		strings.HasPrefix(lower, "ss://") ||
-		strings.HasPrefix(lower, "ssr://") ||
 		strings.HasPrefix(lower, "hysteria2://") ||
 		strings.HasPrefix(lower, "hy2://") ||
 		strings.HasPrefix(lower, "tuic://")
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int) int {
-	score := 100 + (passedServices * 80)
+	score := 100 + (passedServices * 100)
 	lower := strings.ToLower(configStr)
 
+	// Высокий приоритет белым рос. SNI (проходят любые ТСПУ белые списки)
 	if isRuSNI(sni) {
-		score += 350
+		score += 500
 	}
 
+	// REALITY дает максимальную устойчивость на мобильном трафике
 	if strings.Contains(lower, "security=reality") || strings.Contains(lower, "pbk=") {
-		score += 300
+		score += 450
 	}
 
+	// gRPC работает лучше и стабильнее при частой смене IP/вышек мобильного оператора
 	if transport == "grpc" {
-		score += 90
-	} else if transport == "ws" {
-		score += 50
+		score += 120
+	} else if transport == "tcp" {
+		score += 80
 	}
 
+	// Высокий штраф за пинг, чтобы отсеять все медленные конфигурации
 	pingMs := int(latency.Milliseconds())
-	score -= pingMs / 2
+	score -= pingMs * 5
 
 	return score
 }
