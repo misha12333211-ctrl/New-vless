@@ -29,7 +29,7 @@ const (
 	timeout        = 1800 * time.Millisecond
 	serviceTimeout = 5000 * time.Millisecond
 	maxConcurrency = 160 // Оптимизировано под GitHub Actions Runner (2 vCPU)
-	maxOutputLimit = 400 // Максимальное количество итоговых конфигов
+	maxOutputLimit = 350 // Максимальное количество итоговых конфигов
 
 	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
 	StrictRuSNIOnly = false
