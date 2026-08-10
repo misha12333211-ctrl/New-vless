@@ -28,13 +28,12 @@ import (
 )
 
 const (
-	// Жесткий тайм-аут для проверки низкого пинга (50-70 мс на симке)
-	timeout        = 2000 * time.Millisecond
-	serviceTimeout = 6000 * time.Millisecond
-	maxConcurrency = 100 // Максимальный параллелизм для быстрого отсева
-	maxOutputLimit = 300 // Оптимальный объем подписки
+	// Жесткие тайм-ауты для работы внутри GitHub Actions Runner
+	fastPingTimeout = 250 * time.Millisecond // Быстрая проверка сетевой доступности TCP
+	serviceTimeout  = 3500 * time.Millisecond // Максимальный тайм-аут на проверку Xray
+	maxConcurrency  = 150                    // Параллелизм быстрой предпроверки
+	maxOutputLimit  = 300                    // Итоговый размер подписки
 
-	// Максимально допустимый пинг из Runner (Европа), чтобы на симке в РФ было ~50-70 мс
 	maxAllowedRunnerLatency = 45 * time.Millisecond
 
 	StrictRuSNIOnly = false
@@ -59,41 +58,30 @@ type TargetService struct {
 	URL  string
 }
 
-// 7 Обязательных сервисов для обхода блокировок
+// Обязательные сервисы для обхода
 var mandatoryServiceNames = []string{
-	"Google", "YouTube", "Instagram", "Telegram", "WhatsApp", "Viber", "GitHub",
+	"Google", "YouTube", "Telegram", "GitHub",
 }
 
 var targetServices = []TargetService{
 	{Name: "Google", URL: "https://www.google.com/generate_204"},
 	{Name: "YouTube", URL: "https://www.youtube.com"},
-	{Name: "Instagram", URL: "https://www.instagram.com"},
 	{Name: "Telegram", URL: "https://t.me"},
-	{Name: "WhatsApp", URL: "https://web.whatsapp.com"},
-	{Name: "Viber", URL: "https://www.viber.com"},
 	{Name: "GitHub", URL: "https://github.com"},
-	{Name: "Gemini", URL: "https://gemini.google.com"},
-	{Name: "ChatGPT", URL: "https://chatgpt.com"},
-	{Name: "DeepSeek", URL: "https://chat.deepseek.com"},
+	{Name: "Instagram", URL: "https://www.instagram.com"},
+	{Name: "WhatsApp", URL: "https://web.whatsapp.com"},
 }
 
-// Расширенный список белых SNI для обхода ТСПУ 2026
+// Белый список SNI для фильтрации ТСПУ
 var ruWhiteSNIs = []string{
-	// Экосистема VK & Mail.ru
 	"vk.com", "vk.me", "m.vk.com", "userapi.com", "vk-cdn.net", "mail.ru", "ok.ru", "my.games", "vkplay.ru", "vkcompany.ru",
-	// Экосистема Yandex
 	"yandex.ru", "ya.ru", "yastatic.net", "yandex.net", "kinopoisk.ru", "music.yandex.ru", "disk.yandex.ru", "yandex.com",
-	// Банки и Финансы
 	"sberbank.ru", "sber.ru", "online.sberbank.ru", "tbank.ru", "tinkoff.ru", "vtb.ru", "alfabank.ru",
 	"cbr.ru", "open.ru", "raiffeisen.ru", "gazprombank.ru", "psbank.ru", "rshb.ru", "sovcombank.ru",
-	// Государственные ресурсы
 	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "pfr.gov.ru", "kremlin.ru", "customs.gov.ru", "sfr.gov.ru",
-	// Маркетплейсы и Ритейл
 	"ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "market.yandex.ru", "megamarket.ru", "dns-shop.ru",
 	"citilink.ru", "mvideo.ru", "eldorado.ru", "lamoda.ru", "sbermarket.ru", "vprok.ru", "magnit.ru", "5ka.ru",
-	// Телеком и Операторы
 	"mts.ru", "megafon.ru", "beeline.ru", "tele2.ru", "rt.ru", "rostelecom.ru", "yota.ru", "ttk.ru",
-	// Поиск работы, ИТ и медиа
 	"hh.ru", "superjob.ru", "rabota.ru", "habr.com", "3dnews.ru", "rutube.ru", "rbc.ru", "ria.ru", "lenta.ru",
 }
 
@@ -101,35 +89,35 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	startTime := time.Now()
 
-	fmt.Println("=== [1/5] Инициализация высокоскоростного окружения и Xray Core ===")
+	fmt.Println("=== [1/5] Инициализация окружения и Xray Core ===")
 	ensureCoreAvailable()
 
 	sources, err := readLines("sources.txt")
 	if err != nil {
-		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые выходные файлы.\n", err)
+		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые файлы.\n", err)
 		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
 
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
-	fmt.Println("=== [2/5] Быстрый асинхронный сбор и декодирование прокси-конфигураций ===")
+	fmt.Println("=== [2/5] Сбор и декодирование прокси-конфигураций ===")
 
-	rawConfigs := make(chan string, 1000000)
+	rawConfigs := make(chan string, 500000)
 	var wg sync.WaitGroup
 
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          10000,
-		MaxIdleConnsPerHost:   1000,
-		IdleConnTimeout:       30 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
+		MaxIdleConns:          5000,
+		MaxIdleConnsPerHost:   500,
+		IdleConnTimeout:       15 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
 		DisableKeepAlives:     false,
 	}
 	defer tr.CloseIdleConnections()
 
 	sharedHTTPClient := &http.Client{
-		Timeout:   12 * time.Second,
+		Timeout:   7 * time.Second,
 		Transport: tr,
 	}
 
@@ -159,8 +147,8 @@ func main() {
 	}
 
 	totalConfigs := len(uniqueConfigs)
-	fmt.Printf("Собрано %d валидных уникальных прокси-ссылок.\n", totalConfigs)
-	fmt.Println("=== [3/5] Запуск фильтрации низкого пинга (50-70мс) и валидации ТСПУ ===")
+	fmt.Printf("Собрано %d уникальных прокси-ссылок.\n", totalConfigs)
+	fmt.Println("=== [3/5] Молниеносный 2-этапный фильтр (TCP Predial -> Xray Core) ===")
 
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
@@ -174,12 +162,12 @@ func main() {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			if res, ok := testConfig(c); ok {
+			if res, ok := testConfigFast(c); ok {
 				resultsChan <- res
 			}
 
 			curr := atomic.AddInt64(&processedCount, 1)
-			if curr%500 == 0 || curr == int64(totalConfigs) {
+			if curr%1000 == 0 || curr == int64(totalConfigs) {
 				fmt.Printf("Проверено узлов: %d / %d\r", curr, totalConfigs)
 			}
 		}(cfg)
@@ -187,7 +175,7 @@ func main() {
 
 	testWg.Wait()
 	close(resultsChan)
-	fmt.Println("\nТестирование всех узлов полностью завершено.")
+	fmt.Println("\nТестирование полностью завершено.")
 
 	var validResults []ConfigResult
 	for res := range resultsChan {
@@ -196,7 +184,7 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Балансировка подписки (КВОТА RU SNI / REALITY ~85%%) (Валидных: %d) ===\n", len(validResults))
+	fmt.Printf("=== [4/5] Формирование выгрузки (Валидных узлов: %d) ===\n", len(validResults))
 
 	var ruSNIConfigs []ConfigResult
 	var realityConfigs []ConfigResult
@@ -232,7 +220,7 @@ func main() {
 	sortByScore(noSNIConfigs)
 	sortByScore(otherConfigs)
 
-	fmt.Printf("Доступно низколатентных узлов: [RU SNI: %d] | [REALITY: %d] | [No-SNI: %d] | [Прочие: %d]\n",
+	fmt.Printf("Доступно: [RU SNI: %d] | [REALITY: %d] | [No-SNI: %d] | [Прочие: %d]\n",
 		len(ruSNIConfigs), len(realityConfigs), len(noSNIConfigs), len(otherConfigs))
 
 	var selected []ConfigResult
@@ -250,7 +238,6 @@ func main() {
 		return false
 	}
 
-	// 1. Формирование приоритетного пула для белых списков РФ (RU SNI + REALITY)
 	ruTargetQuota := (maxOutputLimit * 85) / 100
 
 	for i := 0; i < len(ruSNIConfigs) && len(selected) < ruTargetQuota; i++ {
@@ -261,7 +248,6 @@ func main() {
 		addUnique(realityConfigs[i])
 	}
 
-	// 2. Заполнение оставшихся мест No-SNI и качественными резервами
 	for _, res := range noSNIConfigs {
 		addUnique(res)
 	}
@@ -277,7 +263,6 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		// Пометка типа конфига для удобства в клиенте
 		tag := "RU-Bypass"
 		if r.IsReality {
 			tag = "REALITY-Fast"
@@ -290,17 +275,17 @@ func main() {
 
 	fmt.Printf("Сформирована итоговая подписка из %d прокси-конфигураций.\n", len(finalSlice))
 
-	fmt.Println("=== [5/5] Запись выходных файлов подписок ===")
+	fmt.Println("=== [5/5] Запись выходных файлов ===")
 	rawOutput := strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
-	fmt.Printf("Процесс успешно завершен за %v! Файлы ready.\n", time.Since(startTime))
+	fmt.Printf("Процесс успешно завершен за %v! Файлы готовы.\n", time.Since(startTime))
 }
 
-func testConfig(configStr string) (ConfigResult, bool) {
+func testConfigFast(configStr string) (ConfigResult, bool) {
 	host, port, sni, _, transport, proto := parseConfigDetails(configStr)
 	if host == "" || port == "" {
 		return ConfigResult{}, false
@@ -308,7 +293,6 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	lowerCfg := strings.ToLower(configStr)
 
-	// Отсекаем устаревшие протоколы, легко блокируемые ТСПУ на мобильных операторах
 	if proto == "ssr" {
 		return ConfigResult{}, false
 	}
@@ -325,14 +309,20 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	// 1. Предварительная проверка совместимости с белыми списками
 	if !simulateTSPUBypassCheck(proto, port, sni, lowerCfg) {
 		return ConfigResult{}, false
 	}
 
-	start := time.Now()
+	// ЭТАП 1: Быстрая предпроверка (TCP / IP Ping). Отсекает ~85% мертвых серверов мгновенно без запуска Xray.
+	addr := net.JoinHostPort(host, port)
+	conn, err := net.DialTimeout("tcp", addr, fastPingTimeout)
+	if err != nil {
+		return ConfigResult{}, false
+	}
+	_ = conn.Close()
 
-	// 2. Проверка через Xray Core
+	// ЭТАП 2: Полная валидация через Xray Core
+	start := time.Now()
 	passedServices, mandatoryPassed := checkTargetServicesViaProxy(configStr)
 	if !mandatoryPassed {
 		return ConfigResult{}, false
@@ -340,7 +330,6 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	latency := time.Since(start)
 
-	// Отбрасываем узлы с высоким пингом из Runner, чтобы на мобильной симке было не выше ~50-70мс
 	if latency > maxAllowedRunnerLatency {
 		return ConfigResult{}, false
 	}
@@ -368,7 +357,6 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	isReality := strings.Contains(lowerCfg, "security=reality") || strings.Contains(lowerCfg, "pbk=")
 	isTLS := strings.Contains(lowerCfg, "security=tls")
 
-	// Разрешаем порты, проходящие фильтрацию
 	validPorts := map[string]bool{
 		"80": true, "443": true, "8080": true, "8443": true, "2053": true, "2083": true, "2087": true, "2096": true, "4433": true,
 	}
@@ -377,12 +365,10 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 		return false
 	}
 
-	// Отсекаем открытый Shadowsocks без маскировки
 	if (proto == "ss" || proto == "shadowsocks") && !ruSNI && !isReality && !validPorts[port] {
 		return false
 	}
 
-	// Фильтрация заблокированных зарубежных SNI
 	if isTLS && !isReality && !ruSNI {
 		blockedSNIs := []string{
 			"cloudflare.com", "cloudfront.net", "facebook.com", "instagram.com",
@@ -399,7 +385,7 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 }
 
 func getFreeLocalPort() (int, error) {
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 15; i++ {
 		n, err := rand.Int(rand.Reader, big.NewInt(25000))
 		if err != nil {
 			continue
@@ -437,9 +423,6 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	cmd := exec.CommandContext(ctx, corePath, "run", "-c", "stdin:")
 	cmd.Stdin = bytes.NewReader(xrayConfigJSON)
 
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
 	if err := cmd.Start(); err != nil {
 		return 0, false
 	}
@@ -454,14 +437,15 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	for i := 0; i < 60; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
+	// Оптимизированный цикл ожидания SOCKS5 сокета (до 150мс)
+	for i := 0; i < 30; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 5*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -480,11 +464,12 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   3000 * time.Millisecond,
+		Timeout:   1500 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
 	var successCount int64
+	var failedMandatory int32
 
 	mandatoryPassedMap := make(map[string]bool)
 	var mapMutex sync.Mutex
@@ -493,11 +478,19 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	}
 
 	for _, service := range targetServices {
+		if atomic.LoadInt32(&failedMandatory) == 1 {
+			break
+		}
+
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
 
-			reqCtx, reqCancel := context.WithTimeout(ctx, 2800*time.Millisecond)
+			if atomic.LoadInt32(&failedMandatory) == 1 {
+				return
+			}
+
+			reqCtx, reqCancel := context.WithTimeout(ctx, 1400*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
@@ -508,6 +501,13 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 			resp, err := client.Do(req)
 			if err != nil {
+				// Оптимизация Fail-Fast: если упал один из mandatory сервисов
+				for _, mName := range mandatoryServiceNames {
+					if mName == s.Name {
+						atomic.StoreInt32(&failedMandatory, 1)
+						break
+					}
+				}
 				return
 			}
 			_, _ = io.Copy(io.Discard, resp.Body)
@@ -520,11 +520,22 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 					mandatoryPassedMap[s.Name] = true
 				}
 				mapMutex.Unlock()
+			} else {
+				for _, mName := range mandatoryServiceNames {
+					if mName == s.Name {
+						atomic.StoreInt32(&failedMandatory, 1)
+						break
+					}
+				}
 			}
 		}(service)
 	}
 
 	wg.Wait()
+
+	if atomic.LoadInt32(&failedMandatory) == 1 {
+		return 0, false
+	}
 
 	mapMutex.Lock()
 	allMandatoryPassed := true
@@ -865,7 +876,7 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 		resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
 	if err != nil {
 		return
 	}
@@ -896,8 +907,8 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 	}
 
 	scanner := bufio.NewScanner(strings.Reader(content))
-	buf := make([]byte, 128*1024)
-	scanner.Buffer(buf, 10*1024*1024)
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 5*1024*1024)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -960,24 +971,20 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 	score := 100 + (passedServices * 100)
 	lower := strings.ToLower(configStr)
 
-	// Высокий приоритет белым рос. SNI (проходят любые ТСПУ белые списки)
 	if isRuSNI(sni) {
 		score += 500
 	}
 
-	// REALITY дает максимальную устойчивость на мобильном трафике
 	if strings.Contains(lower, "security=reality") || strings.Contains(lower, "pbk=") {
 		score += 450
 	}
 
-	// gRPC работает лучше и стабильнее при частой смене IP/вышек мобильного оператора
 	if transport == "grpc" {
 		score += 120
 	} else if transport == "tcp" {
 		score += 80
 	}
 
-	// Высокий штраф за пинг, чтобы отсеять все медленные конфигурации
 	pingMs := int(latency.Milliseconds())
 	score -= pingMs * 5
 
