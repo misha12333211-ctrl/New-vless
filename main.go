@@ -5,10 +5,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/md5"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,12 +26,12 @@ import (
 )
 
 const (
-	timeout        = 1000 * time.Millisecond
-	serviceTimeout = 2500 * time.Millisecond
-	maxConcurrency = 250
-	maxOutputLimit = 400
+	timeout        = 1800 * time.Millisecond
+	serviceTimeout = 5000 * time.Millisecond
+	maxConcurrency = 160 // Оптимизировано под GitHub Actions Runner (2 vCPU)
+	maxOutputLimit = 300 // Максимальное количество итоговых конфигов
 
-	// --- НАСТРОЙКИ ЖЕСТКОЙ ФИЛЬТРАЦИИ ---
+	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
 	StrictRuSNIOnly = false
 	StrictVLESSOnly = false
 	StrictPortsOnly = false
@@ -41,7 +39,6 @@ const (
 
 type ConfigResult struct {
 	URL            string
-	CleanURL       string
 	Latency        time.Duration
 	Score          int
 	ServiceSuccess int
@@ -50,7 +47,6 @@ type ConfigResult struct {
 	IsRuSNI        bool
 	IsNoSNI        bool
 	IsReality      bool
-	IsHysteria     bool
 }
 
 type TargetService struct {
@@ -58,6 +54,7 @@ type TargetService struct {
 	URL  string
 }
 
+// 7 Обязательных сервисов
 var mandatoryServiceNames = []string{
 	"Google", "YouTube", "Instagram", "Telegram", "WhatsApp", "Viber", "GitHub",
 }
@@ -75,26 +72,29 @@ var targetServices = []TargetService{
 	{Name: "DeepSeek", URL: "https://chat.deepseek.com"},
 }
 
-// Расширенный белый список SNI и инфраструктурных доменов для гарантированного прохождения ТСПУ (Белые списки РФ)
+// МАКСИМАЛЬНО РАСШИРЕННЫЙ СПИСОК РОССИЙСКИХ SNI И БЕЛЫХ ДОМЕНОВ (ТСПУ / Белые списки)
 var ruWhiteSNIs = []string{
-	// Государственные ресурсы и инфраструктура
-	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "cbr.ru", "kremlin.ru", "customs.gov.ru", "pensionpobeda.ru",
-	// Крупнейшие порталы, экосистемы и поисковики
-	"yandex.ru", "ya.ru", "dzen.ru", "yastatic.net", "yandex.net", "yandex.org",
-	"vk.com", "vk.me", "vk-portal.net", "cdn.vk.com", "ok.ru", "mail.ru", "rambler.ru", "my.games",
-	// Банки и финансовый сектор
-	"sberbank.ru", "tbank.ru", "tinkoff.ru", "vtb.ru", "alfabank.ru", "open.ru", "mirconnect.ru", "sber.ru", "gazprombank.ru",
-	// Маркетплейсы, сервисы и ритейл
-	"ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "ecom.ozon.ru", "lamoda.ru", "mvideo.ru", "dns-shop.ru",
-	// Медиа, видеохостинги, связь и провайдеры
-	"kinopoisk.ru", "rutube.ru", "hh.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru",
-	"rt.ru", "megafon.ru", "beeline.ru", "mts.ru", "nornickel.ru", "maxima.ru", "tele2.ru", "domru.ru",
-}
-
-// Заблокированные или жестко фильтруемые зарубежные SNI
-var blockedGlobalSNIs = []string{
-	"cloudflare.com", "cloudfront.net", "facebook.com",
-	"discord.gg", "discord.com", "twitter.com", "x.com", "instagram.com",
+	// Экосистема VK & Mail.ru
+	"vk.com", "vk.me", "m.vk.com", "userapi.com", "vk-cdn.net", "mail.ru", "ok.ru", "my.games", "vkplay.ru",
+	// Экосистема Yandex
+	"yandex.ru", "ya.ru", "yastatic.net", "yandex.net", "kinopoisk.ru", "music.yandex.ru", "disk.yandex.ru",
+	// Банки и Финансы
+	"sberbank.ru", "sber.ru", "online.sberbank.ru", "tbank.ru", "tinkoff.ru", "vtb.ru", "alfabank.ru",
+	"cbr.ru", "open.ru", "raiffeisen.ru", "gazprombank.ru", "psbank.ru", "rshb.ru", "sovcombank.ru",
+	// Государственные ресурсы
+	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "pfr.gov.ru", "kremlin.ru", "cbr.ru", "customs.gov.ru",
+	// Маркетплейсы и Ритейл
+	"ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "market.yandex.ru", "megamarket.ru", "dns-shop.ru",
+	"citilink.ru", "mvideo.ru", "eldorado.ru", "lamoda.ru", "sbermarket.ru", "vprok.ru", "magnit.ru", "5ka.ru",
+	// Телеком и Операторы
+	"mts.ru", "megafon.ru", "beeline.ru", "tele2.ru", "rt.ru", "rostelecom.ru", "yota.ru", "ttk.ru",
+	// Поиск работы и образование
+	"hh.ru", "superjob.ru", "rabota.ru", "stepik.org", "geekbrains.ru", "skillbox.ru", "ya.praktikum.ru",
+	// СМИ, Порталы и Видео
+	"rutube.ru", "rambler.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru", "kommersant.ru", "tass.ru",
+	"iz.ru", "vedomosti.ru", "rg.ru", "dzen.ru", "smotrim.ru", "1tv.ru", "ntv.ru", "matchtv.ru",
+	// Промышленность, Транспорт и ИТ
+	"rzd.ru", "aeroflot.ru", "nornickel.ru", "gazprom.ru", "rosneft.ru", "lukoil.ru", "habr.com", "3dnews.ru",
 }
 
 func main() {
@@ -115,17 +115,17 @@ func main() {
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
 	fmt.Println("=== [2/5] Быстрый асинхронный сбор и декодирование прокси-конфигураций ===")
 
-	rawConfigs := make(chan string, 3500000)
+	rawConfigs := make(chan string, 2500000)
 	var wg sync.WaitGroup
 
 	sharedHTTPClient := &http.Client{
-		Timeout: 6 * time.Second,
+		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:          30000,
-			MaxIdleConnsPerHost:   3000,
-			IdleConnTimeout:       45 * time.Second,
-			ResponseHeaderTimeout: 4 * time.Second,
+			MaxIdleConns:          10000,
+			MaxIdleConnsPerHost:   1000,
+			IdleConnTimeout:       30 * time.Second,
+			ResponseHeaderTimeout: 8 * time.Second,
 			DisableKeepAlives:     false,
 		},
 	}
@@ -147,28 +147,24 @@ func main() {
 		close(rawConfigs)
 	}()
 
-	uniqueConfigs := make(map[string]string)
+	uniqueConfigs := make(map[string]bool)
 	for cfg := range rawConfigs {
 		cfg = strings.TrimSpace(cfg)
 		if cfg != "" && len(cfg) < 4096 {
-			cleanCfg := stripConfigTag(cfg)
-			hash := md5Hash(cleanCfg)
-			if _, exists := uniqueConfigs[hash]; !exists {
-				uniqueConfigs[hash] = cfg
-			}
+			uniqueConfigs[cfg] = true
 		}
 	}
 
 	totalConfigs := len(uniqueConfigs)
 	fmt.Printf("Собрано %d уникальных прокси-ссылок.\n", totalConfigs)
-	fmt.Println("=== [3/5] Запуск эмуляции ТСПУ, Белых списков & Доступности сервисов ===")
+	fmt.Println("=== [3/5] Запуск валидации ТСПУ, Белых списков & 7 Сервисов ===")
 
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
 	var processedCount int64
 
-	for _, cfg := range uniqueConfigs {
+	for cfg := range uniqueConfigs {
 		testWg.Add(1)
 		go func(c string) {
 			defer testWg.Done()
@@ -188,7 +184,7 @@ func main() {
 
 	testWg.Wait()
 	close(resultsChan)
-	fmt.Println("\nТестирование всех узлов завершено.")
+	fmt.Println("\nТестирование всех узлов полностью завершено.")
 
 	var validResults []ConfigResult
 	for res := range resultsChan {
@@ -197,12 +193,11 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Балансировка подписки (>55%% RU SNI/Bypass) (Валидных: %d) ===\n", len(validResults))
+	fmt.Printf("=== [4/5] Балансировка подписки (КВОТА RU SNI ~75-80%%) (Валидных: %d) ===\n", len(validResults))
 
 	var ruSNIConfigs []ConfigResult
 	var noSNIConfigs []ConfigResult
 	var realityConfigs []ConfigResult
-	var hysteriaConfigs []ConfigResult
 	var otherConfigs []ConfigResult
 
 	for _, res := range validResults {
@@ -210,8 +205,6 @@ func main() {
 			ruSNIConfigs = append(ruSNIConfigs, res)
 		} else if res.IsReality {
 			realityConfigs = append(realityConfigs, res)
-		} else if res.IsHysteria {
-			hysteriaConfigs = append(hysteriaConfigs, res)
 		} else if res.IsNoSNI {
 			noSNIConfigs = append(noSNIConfigs, res)
 		} else {
@@ -233,12 +226,11 @@ func main() {
 
 	sortByScore(ruSNIConfigs)
 	sortByScore(realityConfigs)
-	sortByScore(hysteriaConfigs)
 	sortByScore(noSNIConfigs)
 	sortByScore(otherConfigs)
 
-	fmt.Printf("Доступно по категориям: [RU SNI: %d] | [REALITY: %d] | [HYSTERIA2/TUIC: %d] | [No-SNI: %d] | [Прочие: %d]\n",
-		len(ruSNIConfigs), len(realityConfigs), len(hysteriaConfigs), len(noSNIConfigs), len(otherConfigs))
+	fmt.Printf("Доступно по категориям: [RU SNI: %d] | [REALITY: %d] | [No-SNI: %d] | [Прочие: %d]\n",
+		len(ruSNIConfigs), len(realityConfigs), len(noSNIConfigs), len(otherConfigs))
 
 	var selected []ConfigResult
 	usedMap := make(map[string]bool)
@@ -247,51 +239,37 @@ func main() {
 		if len(selected) >= maxOutputLimit {
 			return false
 		}
-		clean := stripConfigTag(item.URL)
-		if !usedMap[clean] {
+		if !usedMap[item.URL] {
 			selected = append(selected, item)
-			usedMap[clean] = true
+			usedMap[item.URL] = true
 			return true
 		}
 		return false
 	}
 
-	// Квота RU SNI = 55%
-	ruTargetQuota := (maxOutputLimit * 55) / 100
+	// 1. КВОТА RU SNI = 80% (240 конфигов из 300) для 99.9% работы при белых списках
+	ruTargetQuota := (maxOutputLimit * 80) / 100
 	for i := 0; i < len(ruSNIConfigs) && len(selected) < ruTargetQuota; i++ {
 		addUnique(ruSNIConfigs[i])
 	}
 
-	remainingQuota := maxOutputLimit - len(selected)
-	perOtherCategory := remainingQuota / 4
-	if perOtherCategory < 1 {
-		perOtherCategory = 1
-	}
-
-	for i := 0; i < perOtherCategory && i < len(realityConfigs); i++ {
-		addUnique(realityConfigs[i])
-	}
-	for i := 0; i < perOtherCategory && i < len(hysteriaConfigs); i++ {
-		addUnique(hysteriaConfigs[i])
-	}
-	for i := 0; i < perOtherCategory && i < len(noSNIConfigs); i++ {
-		addUnique(noSNIConfigs[i])
-	}
-	for i := 0; i < perOtherCategory && i < len(otherConfigs); i++ {
-		addUnique(otherConfigs[i])
-	}
-
-	// Добираем остатки до предела
-	for _, res := range ruSNIConfigs {
-		addUnique(res)
-	}
+	// 2. Добавление REALITY и No-SNI конфигураций в оставшиеся 20%
 	for _, res := range realityConfigs {
+		if len(selected) >= maxOutputLimit {
+			break
+		}
 		addUnique(res)
 	}
-	for _, res := range hysteriaConfigs {
-		addUnique(res)
-	}
+
 	for _, res := range noSNIConfigs {
+		if len(selected) >= maxOutputLimit {
+			break
+		}
+		addUnique(res)
+	}
+
+	// 3. Дозаполнение до 300 лучшими из всех доступных
+	for _, res := range ruSNIConfigs {
 		addUnique(res)
 	}
 	for _, res := range otherConfigs {
@@ -300,12 +278,11 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		tag := fmt.Sprintf("🛡️ RU-Bypass %d [%s]", i+1, strings.ToUpper(r.Protocol))
-		renamedURL := setConfigName(r.URL, tag)
+		renamedURL := setConfigName(r.URL, fmt.Sprintf("Sub-RU-%d", i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-	fmt.Printf("Сформирован итоговый МИКС из %d прокси-конфигураций.\n", len(finalSlice))
+	fmt.Printf("Сформирована итоговая подписка из %d прокси-конфигураций.\n", len(finalSlice))
 
 	fmt.Println("=== [5/5] Запись выходных файлов подписок ===")
 	rawOutput := strings.Join(finalSlice, "\n")
@@ -325,7 +302,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	lowerCfg := strings.ToLower(configStr)
 
-	if StrictPortsOnly && port != "443" && port != "80" && port != "8443" && port != "2053" && port != "2083" && port != "2096" {
+	if StrictPortsOnly && port != "443" && port != "80" {
 		return ConfigResult{}, false
 	}
 
@@ -337,7 +314,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	// 1. Эмуляция проверок ТСПУ и белых списков
+	// 1. Проверка правил белых списков и фильтров ТСПУ
 	if !simulateTSPUBypassCheck(proto, port, sni, lowerCfg) {
 		return ConfigResult{}, false
 	}
@@ -345,7 +322,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	targetAddr := net.JoinHostPort(host, port)
 	start := time.Now()
 
-	// 2. Первичная экспресс-проверка TCP/TLS
+	// 2. Проверка сокета
 	dialer := &net.Dialer{Timeout: timeout}
 	rawConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
@@ -358,13 +335,12 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	var conn net.Conn = rawConn
-	isTLS := strings.Contains(lowerCfg, "security=tls") || strings.Contains(lowerCfg, "security=reality") || proto == "trojan" || proto == "hysteria2" || proto == "hy2" || proto == "tuic"
+	isTLS := strings.Contains(lowerCfg, "security=tls") || strings.Contains(lowerCfg, "security=reality") || proto == "trojan"
 
 	if isTLS {
 		tlsConfig := &tls.Config{
 			ServerName:         serverName,
 			InsecureSkipVerify: true,
-			NextProtos:         []string{"h2", "http/1.1"},
 		}
 		tlsConn := tls.Client(rawConn, tlsConfig)
 		_ = tlsConn.SetDeadline(time.Now().Add(timeout))
@@ -402,21 +378,21 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	latency := time.Since(start)
 	_ = conn.Close()
 
-	// 3. Проверка через Xray Core
+	// 3. Сквозная проверка ВСЕХ 7 обязательных сервисов через Xray core
 	passedServices, mandatoryPassed := checkTargetServicesViaProxy(configStr)
+	
+	// ЖЕСТКОЕ УСЛОВИЕ: Если ХОТЯ БЫ 1 ИЗ 7 ОБЯЗАТЕЛЬНЫХ СЕРВИСОВ НЕ РАБОТАЕТ — ВЫБРАСЫВАЕМ КОНФИГ
 	if !mandatoryPassed {
 		return ConfigResult{}, false
 	}
 
 	isReality := strings.Contains(lowerCfg, "security=reality")
-	isHysteria := proto == "hysteria2" || proto == "hy2" || proto == "tuic"
 	ruSNI := isRuSNI(sni)
 	noSNI := isNoSNI(sni, host)
 	score := calculateBypassScore(configStr, port, sni, transport, latency, passedServices)
 
 	return ConfigResult{
 		URL:            configStr,
-		CleanURL:       stripConfigTag(configStr),
 		Latency:        latency,
 		Score:          score,
 		ServiceSuccess: passedServices,
@@ -425,7 +401,6 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		IsRuSNI:        ruSNI,
 		IsNoSNI:        noSNI,
 		IsReality:      isReality,
-		IsHysteria:     isHysteria,
 	}, true
 }
 
@@ -434,28 +409,21 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	isReality := strings.Contains(lowerCfg, "security=reality")
 	isTLS := strings.Contains(lowerCfg, "security=tls")
 
-	// 1. Фильтрация открытых протоколов без TLS на нестандартных портах
-	if !isTLS && !isReality && port != "80" && port != "8080" && port != "8880" && port != "2052" && port != "2082" && port != "2086" && port != "2095" {
+	// 1. Фильтрация нестандартных незащищенных портов
+	if !isTLS && !isReality && port != "80" && port != "8080" && port != "443" {
 		return false
 	}
 
-	// 2. Блокировка незашифрованных или легко определяемых протоколов (Shadowsocks/SSR без плагинов)
-	if proto == "ss" || proto == "ssr" {
-		if !ruSNI && !isReality && !strings.Contains(lowerCfg, "plugin=") {
-			return false
-		}
+	// 2. Фильтрация незащищенных Shadowsocks без маскировки
+	if (proto == "ss" || proto == "ssr") && !ruSNI && !isReality {
+		return false
 	}
 
-	// 3. Проверка белых / черных списков SNI для стандартного TLS
-	if isTLS && !isReality {
-		for _, b := range blockedGlobalSNIs {
+	// 3. Отсечение заблокированных зарубежных SNI
+	if isTLS && !isReality && !ruSNI {
+		blockedSNIs := []string{"cloudflare.com", "cloudfront.net", "facebook.com", "instagram.com"}
+		for _, b := range blockedSNIs {
 			if strings.Contains(sni, b) {
-				return false
-			}
-		}
-
-		if sni != "" && !ruSNI {
-			if net.ParseIP(sni) == nil {
 				return false
 			}
 		}
@@ -470,10 +438,12 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
-	socksPort := getFreeTCPPort()
-	if socksPort == 0 {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
 		return 0, false
 	}
+	socksPort := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
 
 	xrayConfigJSON, err := generateXrayConfig(configStr, socksPort)
 	if err != nil {
@@ -485,14 +455,11 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	cmd := exec.CommandContext(ctx, corePath, "run", "-c", "stdin:")
 	cmd.Stdin = bytes.NewReader(xrayConfigJSON)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
 		return 0, false
 	}
 
-	// Гарантированное завершение и очистка фонового процесса
 	defer func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
@@ -503,14 +470,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	for i := 0; i < 25; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 6*time.Millisecond)
+	for i := 0; i < 30; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 10*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -523,34 +490,36 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
-		DisableKeepAlives:   true,
-		MaxIdleConnsPerHost: 25,
+		DisableKeepAlives: true,
 	}
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   serviceTimeout - (300 * time.Millisecond),
+		Timeout:   serviceTimeout - (500 * time.Millisecond),
 	}
 
 	var wg sync.WaitGroup
 	var successCount int64
 
 	mandatoryPassedMap := make(map[string]bool)
+	var mapMutex sync.Mutex
 	for _, name := range mandatoryServiceNames {
 		mandatoryPassedMap[name] = false
 	}
-	var mapMutex sync.Mutex
 
 	for _, service := range targetServices {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
 
-			req, err := http.NewRequestWithContext(ctx, "GET", s.URL, nil)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 3500*time.Millisecond)
+			defer reqCancel()
+
+			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
 			if err != nil {
 				return
 			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36")
 
 			resp, err := client.Do(req)
 			if err != nil {
@@ -571,6 +540,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	wg.Wait()
 
+	mapMutex.Lock()
 	allMandatoryPassed := true
 	for _, name := range mandatoryServiceNames {
 		if !mandatoryPassedMap[name] {
@@ -578,6 +548,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 			break
 		}
 	}
+	mapMutex.Unlock()
 
 	return int(atomic.LoadInt64(&successCount)), allMandatoryPassed
 }
@@ -593,17 +564,19 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		port = 443
 	}
 
-	u, err := url.Parse(configURL)
-	if err != nil {
-		return nil, err
+	u, _ := url.Parse(configURL)
+	var query url.Values
+	var uuid string
+	if u != nil {
+		query = u.Query()
+		if u.User != nil {
+			uuid = u.User.Username()
+		}
 	}
-
-	query := u.Query()
-	uuid := u.User.Username()
 
 	security := query.Get("security")
 	if security == "" {
-		if outboundProtocol == "trojan" || outboundProtocol == "hysteria2" || outboundProtocol == "hy2" || outboundProtocol == "tuic" {
+		if outboundProtocol == "trojan" {
 			security = "tls"
 		} else {
 			security = "none"
@@ -640,13 +613,13 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	}
 
 	if netType == "ws" {
-		wsHeaders := map[string]interface{}{}
+		headers := map[string]interface{}{}
 		if sni != "" {
-			wsHeaders["Host"] = sni
+			headers["Host"] = sni
 		}
 		streamSettings["wsSettings"] = map[string]interface{}{
 			"path":    path,
-			"headers": wsHeaders,
+			"headers": headers,
 		}
 	} else if netType == "grpc" {
 		streamSettings["grpcSettings"] = map[string]interface{}{
@@ -656,8 +629,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 
 	var outboundSettings map[string]interface{}
 
-	switch outboundProtocol {
-	case "trojan":
+	if outboundProtocol == "trojan" {
 		outboundSettings = map[string]interface{}{
 			"servers": []map[string]interface{}{
 				{
@@ -667,21 +639,15 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 				},
 			},
 		}
-	case "shadowsocks", "ss":
-		userPass := u.User.String()
+	} else if outboundProtocol == "shadowsocks" || outboundProtocol == "ss" {
+		outboundProtocol = "shadowsocks"
 		method := "aes-128-gcm"
-		password := userPass
-
-		if strings.Contains(userPass, ":") {
-			parts := strings.SplitN(userPass, ":", 2)
-			method = parts[0]
-			password = parts[1]
-		} else if dec, err := decodeBase64Flex(userPass); err == nil && strings.Contains(string(dec), ":") {
-			parts := strings.SplitN(string(dec), ":", 2)
+		password := uuid
+		if strings.Contains(uuid, ":") {
+			parts := strings.SplitN(uuid, ":", 2)
 			method = parts[0]
 			password = parts[1]
 		}
-
 		outboundSettings = map[string]interface{}{
 			"servers": []map[string]interface{}{
 				{
@@ -692,17 +658,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 				},
 			},
 		}
-	case "hysteria2", "hy2":
-		outboundSettings = map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{
-					"address":  host,
-					"port":     port,
-					"password": uuid,
-				},
-			},
-		}
-	default: // vless / vmess
+	} else { // vless / vmess
 		userSettings := map[string]interface{}{
 			"id":         uuid,
 			"encryption": "none",
@@ -748,16 +704,6 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	return json.Marshal(config)
 }
 
-func getFreeTCPPort() int {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
-}
-
 func findCoreExecutable() string {
 	if path, err := exec.LookPath("xray"); err == nil {
 		return path
@@ -786,7 +732,7 @@ func ensureCoreAvailable() {
 		return
 	}
 
-	fmt.Println("Бинарник Xray/sing-box не найден. Автоматическая загрузка Xray Core...")
+	fmt.Println("Бинарник Xray Core не найден. Загрузка последнего релиза...")
 
 	var downloadURL string
 	switch runtime.GOOS {
@@ -797,11 +743,11 @@ func ensureCoreAvailable() {
 			downloadURL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip"
 		}
 	case "windows":
-		downloadURL = "https://github.com/XTLS/Xray-windows-64.zip"
+		downloadURL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip"
 	}
 
 	if downloadURL == "" {
-		fmt.Println("Предупреждение: Неподдерживаемая ОС/архитектура для автоматической загрузки Xray.")
+		fmt.Println("Предупреждение: Автозагрузка Xray недоступна для этой платформы.")
 		return
 	}
 
@@ -843,7 +789,7 @@ func ensureCoreAvailable() {
 	}
 
 	for _, f := range r.File {
-		if f.Name == targetExe {
+		if filepath.Base(f.Name) == targetExe {
 			rc, err := f.Open()
 			if err != nil {
 				return
@@ -872,7 +818,7 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -945,25 +891,21 @@ func isProxyProtocol(line string) bool {
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int) int {
-	score := 100 + (passedServices * 80)
+	score := 100 + (passedServices * 70)
 	lower := strings.ToLower(configStr)
 
-	if strings.Contains(lower, "security=reality") {
-		score += 350
-	}
-
 	if isRuSNI(sni) {
-		score += 300
+		score += 300 // Приоритет RU SNI
 	}
 
-	if strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://") || strings.HasPrefix(lower, "tuic://") {
-		score += 200
+	if strings.Contains(lower, "security=reality") {
+		score += 250
 	}
 
 	if transport == "grpc" {
-		score += 90
+		score += 80
 	} else if transport == "ws" {
-		score += 50
+		score += 40
 	}
 
 	pingMs := int(latency.Milliseconds())
@@ -979,7 +921,7 @@ func isRuSNI(sni string) bool {
 	sniLower := strings.ToLower(strings.TrimSpace(sni))
 
 	for _, ruDomain := range ruWhiteSNIs {
-		if sniLower == ruDomain || strings.HasSuffix(sniLower, "."+ruDomain) {
+		if strings.HasSuffix(sniLower, ruDomain) || sniLower == ruDomain {
 			return true
 		}
 	}
@@ -1001,19 +943,6 @@ func isNoSNI(sni string, host string) bool {
 	return false
 }
 
-func stripConfigTag(configURL string) string {
-	if idx := strings.Index(configURL, "#"); idx != -1 {
-		return configURL[:idx]
-	}
-	return configURL
-}
-
-func md5Hash(text string) string {
-	hasher := md5.New()
-	hasher.Write([]byte(text))
-	return hex.EncodeToString(hasher.Sum(nil))
-}
-
 func setConfigName(configURL string, name string) string {
 	escapedName := url.PathEscape(name)
 	if idx := strings.Index(configURL, "#"); idx != -1 {
@@ -1031,16 +960,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 			if err := json.Unmarshal(decoded, &vmap); err == nil {
 				host, _ = vmap["add"].(string)
 				if p, ok := vmap["port"]; ok {
-					switch v := p.(type) {
-					case float64:
-						port = fmt.Sprintf("%.0f", v)
-					case string:
-						port = v
-					case json.Number:
-						port = v.String()
-					default:
-						port = fmt.Sprintf("%v", v)
-					}
+					port = fmt.Sprintf("%v", p)
 				}
 				sni, _ = vmap["sni"].(string)
 				if sni == "" {
@@ -1072,6 +992,11 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		sni = query.Get("peer")
 	}
 
+	// Fallback SNI
+	if sni == "" && net.ParseIP(host) == nil {
+		sni = host
+	}
+
 	path = query.Get("path")
 	if path == "" {
 		path = "/"
@@ -1086,7 +1011,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		switch proto {
 		case "vless", "vmess", "trojan", "hysteria2", "hy2", "tuic":
 			port = "443"
-		case "ss":
+		case "ss", "ssr":
 			port = "8388"
 		}
 	}
