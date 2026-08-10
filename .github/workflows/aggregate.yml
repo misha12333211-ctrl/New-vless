@@ -2,7 +2,7 @@ name: Aggregate Subscriptions
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Запуск каждые 6 часов
+    - cron: '*/30 * * * *' 
   workflow_dispatch: # Возможность запустить вручную одной кнопкой
 
 jobs:
