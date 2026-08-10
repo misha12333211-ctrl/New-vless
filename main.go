@@ -76,7 +76,8 @@ func main() {
 	var wg sync.WaitGroup
 
 	for _, src := range sources {
-		if strings.TrimSpace(src) == "" || strings.HasPrefix(src, "#") {
+		src = strings.TrimSpace(src)
+		if src == "" || strings.HasPrefix(src, "#") {
 			continue
 		}
 		wg.Add(1)
@@ -160,8 +161,17 @@ func main() {
 }
 
 func fetchSubscription(targetURL string, out chan<- string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0")
+
 	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(targetURL)
+	resp, err := client.Do(req)
 	if err != nil {
 		return
 	}
@@ -173,7 +183,16 @@ func fetchSubscription(targetURL string, out chan<- string) {
 	}
 
 	content := string(body)
-	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(content)); err == nil {
+	cleanContent := strings.TrimSpace(content)
+	cleanContent = strings.ReplaceAll(cleanContent, "\r", "")
+	cleanContent = strings.ReplaceAll(cleanContent, "\n", "")
+
+	// Попытка декодировать Base64 (стандартным или URL безопасным кодеком)
+	if decoded, err := base64.StdEncoding.DecodeString(cleanContent); err == nil {
+		content = string(decoded)
+	} else if decoded, err := base64.URLEncoding.DecodeString(cleanContent); err == nil {
+		content = string(decoded)
+	} else if decoded, err := base64.RawStdEncoding.DecodeString(cleanContent); err == nil {
 		content = string(decoded)
 	}
 
@@ -329,22 +348,17 @@ func checkTargetServicesViaProxy(configStr string) int {
 	}
 	tmpFile.Close()
 
-	// Находим бинарник xray или sing-box в системе
+	// Находим бинарник xray в системе
 	corePath := findCoreExecutable()
 	if corePath == "" {
-		// Fallback: Если ядра нет в PATH, возвращаем имитацию проверки
-		return checkTargetServices(configStr)
+		// Если ядра нет, возвращаем 0, так как проверяем только реальный VLESS проход
+		return 0
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout*2)
+	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout+2*time.Second)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	if strings.Contains(corePath, "sing-box") {
-		cmd = exec.CommandContext(ctx, corePath, "run", "-c", tmpFile.Name())
-	} else {
-		cmd = exec.CommandContext(ctx, corePath, "run", "-c", tmpFile.Name())
-	}
+	cmd := exec.CommandContext(ctx, corePath, "run", "-c", tmpFile.Name())
 
 	if err := cmd.Start(); err != nil {
 		return 0
@@ -355,8 +369,22 @@ func checkTargetServicesViaProxy(configStr string) int {
 		}
 	}()
 
-	// Даем ядру 300мс на старт SOCKS5 сервера
-	time.Sleep(300 * time.Millisecond)
+	// Ожидание готовности локального SOCKS5 порта вместо «слепого» sleep
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
+	ready := false
+	for i := 0; i < 15; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 50*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			ready = true
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if !ready {
+		return 0
+	}
 
 	proxyURL, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", socksPort))
 	transport := &http.Transport{
@@ -379,7 +407,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 		go func(s TargetService) {
 			defer wg.Done()
 
-			req, err := http.NewRequest("GET", s.URL, nil)
+			req, err := http.NewRequestWithContext(ctx, "GET", s.URL, nil)
 			if err != nil {
 				successChan <- false
 				return
@@ -453,8 +481,46 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	}
 
 	path := query.Get("path")
+	flow := query.Get("flow")
 
-	// Формируем JSON конфигурацию для Xray Core
+	streamSettings := map[string]interface{}{
+		"network":  netType,
+		"security": security,
+	}
+
+	if security == "tls" {
+		streamSettings["tlsSettings"] = map[string]interface{}{
+			"serverName":    sni,
+			"fingerprint":   fp,
+			"allowInsecure": true,
+		}
+	} else if security == "reality" {
+		streamSettings["realitySettings"] = map[string]interface{}{
+			"serverName":  sni,
+			"fingerprint": fp,
+			"publicKey":   pbk,
+			"shortId":     sid,
+		}
+	}
+
+	if netType == "ws" {
+		streamSettings["wsSettings"] = map[string]interface{}{
+			"path": path,
+		}
+	} else if netType == "grpc" {
+		streamSettings["grpcSettings"] = map[string]interface{}{
+			"serviceName": query.Get("serviceName"),
+		}
+	}
+
+	vnextUser := map[string]interface{}{
+		"id":         uuid,
+		"encryption": "none",
+	}
+	if flow != "" {
+		vnextUser["flow"] = flow
+	}
+
 	config := map[string]interface{}{
 		"log": map[string]interface{}{
 			"loglevel": "none",
@@ -477,36 +543,11 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 						{
 							"address": host,
 							"port":    port,
-							"users": []map[string]interface{}{
-								{
-									"id":       uuid,
-									"encryption": "none",
-								},
-							},
+							"users":   []map[string]interface{}{vnextUser},
 						},
 					},
 				},
-				"streamSettings": map[string]interface{}{
-					"network":  netType,
-					"security": security,
-					"tlsSettings": map[string]interface{}{
-						"serverName":    sni,
-						"fingerprint":   fp,
-						"allowInsecure": true,
-					},
-					"realitySettings": map[string]interface{}{
-						"serverName":  sni,
-						"fingerprint": fp,
-						"publicKey":   pbk,
-						"shortId":     sid,
-					},
-					"wsSettings": map[string]interface{}{
-						"path": path,
-					},
-					"grpcSettings": map[string]interface{}{
-						"serviceName": query.Get("serviceName"),
-					},
-				},
+				"streamSettings": streamSettings,
 			},
 		},
 	}
@@ -515,11 +556,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 }
 
 func getFreePort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
-	}
-	l, err := net.ListenTCP("tcp", addr)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, err
 	}
@@ -535,7 +572,6 @@ func findCoreExecutable() string {
 		return path
 	}
 
-	// Проверка текущей директории
 	cwd, err := os.Getwd()
 	if err == nil {
 		xrayLocal := filepath.Join(cwd, "xray")
@@ -552,7 +588,7 @@ func findCoreExecutable() string {
 }
 
 // ----------------------------------------------------------------------------------
-//   ВСЕ ОСТАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (СОХРАНЕНЫ БЕЗ ИЗМЕНЕНИЙ)
+//   ВСЕ ОСТАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (СОХРАНЕНЫ С ИСПРАВЛЕНИЯМИ)
 // ----------------------------------------------------------------------------------
 
 func checkTargetServices(configStr string) int {
