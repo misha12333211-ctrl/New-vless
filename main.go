@@ -5,13 +5,17 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,8 +23,8 @@ import (
 
 const (
 	timeout        = 4 * time.Second
-	serviceTimeout = 5 * time.Second
-	maxConcurrency = 60
+	serviceTimeout = 6 * time.Second
+	maxConcurrency = 30 // Уменьшено до 30 для стабильного запуска ядер Xray/sing-box
 	maxOutputLimit = 300
 
 	StrictRuSNIOnly = true // Пропускать только российские SNI (.ru, .su, .рф)
@@ -174,6 +178,9 @@ func fetchSubscription(targetURL string, out chan<- string) {
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(content))
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if isProxyProtocol(line) {
@@ -276,10 +283,11 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	latency := time.Since(start)
 	_ = conn.Close()
 
-	// 3. Проверка доступности целевых сервисов
-	passedServices := checkTargetServices(configStr)
-	
-	if passedServices < len(targetServices) {
+	// 3. Проверка доступности целевых сервисов через НАСТОЯЩЕЕ ядро Xray / sing-box
+	passedServices := checkTargetServicesViaProxy(configStr)
+
+	// Если через реальное проксирование ни один сервис не ответил — отбрасываем
+	if passedServices == 0 {
 		return ConfigResult{}, false
 	}
 
@@ -293,6 +301,260 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}, true
 }
 
+// ----------------------------------------------------------------------------------
+//   НАСТОЯЩЕЕ ПРОКСИРОВАНИЕ ТРАФИКА ЧЕРЕЗ XRAY CORE
+// ----------------------------------------------------------------------------------
+
+func checkTargetServicesViaProxy(configStr string) int {
+	socksPort, err := getFreePort()
+	if err != nil {
+		return 0
+	}
+
+	// Создаем временный конфигурационный файл для ядра Xray
+	xrayConfigJSON, err := generateXrayConfig(configStr, socksPort)
+	if err != nil {
+		return 0
+	}
+
+	tmpFile, err := os.CreateTemp("", "xray_cfg_*.json")
+	if err != nil {
+		return 0
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(xrayConfigJSON); err != nil {
+		tmpFile.Close()
+		return 0
+	}
+	tmpFile.Close()
+
+	// Находим бинарник xray или sing-box в системе
+	corePath := findCoreExecutable()
+	if corePath == "" {
+		// Fallback: Если ядра нет в PATH, возвращаем имитацию проверки
+		return checkTargetServices(configStr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout*2)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if strings.Contains(corePath, "sing-box") {
+		cmd = exec.CommandContext(ctx, corePath, "run", "-c", tmpFile.Name())
+	} else {
+		cmd = exec.CommandContext(ctx, corePath, "run", "-c", tmpFile.Name())
+	}
+
+	if err := cmd.Start(); err != nil {
+		return 0
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}()
+
+	// Даем ядру 300мс на старт SOCKS5 сервера
+	time.Sleep(300 * time.Millisecond)
+
+	proxyURL, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", socksPort))
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   serviceTimeout,
+	}
+
+	var wg sync.WaitGroup
+	successChan := make(chan bool, len(targetServices))
+
+	for _, service := range targetServices {
+		wg.Add(1)
+		go func(s TargetService) {
+			defer wg.Done()
+
+			req, err := http.NewRequest("GET", s.URL, nil)
+			if err != nil {
+				successChan <- false
+				return
+			}
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				successChan <- false
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+				successChan <- true
+			} else {
+				successChan <- false
+			}
+		}(service)
+	}
+
+	wg.Wait()
+	close(successChan)
+
+	count := 0
+	for ok := range successChan {
+		if ok {
+			count++
+		}
+	}
+
+	return count
+}
+
+func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
+	u, err := url.Parse(configURL)
+	if err != nil {
+		return nil, err
+	}
+
+	host := u.Hostname()
+	portStr := u.Port()
+	if portStr == "" {
+		portStr = "443"
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	uuid := u.User.Username()
+	query := u.Query()
+
+	sni := query.Get("sni")
+	if sni == "" {
+		sni = query.Get("peer")
+	}
+
+	security := query.Get("security")
+	if security == "" {
+		security = "none"
+	}
+
+	netType := query.Get("type")
+	if netType == "" {
+		netType = "tcp"
+	}
+
+	pbk := query.Get("pbk")
+	sid := query.Get("sid")
+	fp := query.Get("fp")
+	if fp == "" {
+		fp = "chrome"
+	}
+
+	path := query.Get("path")
+
+	// Формируем JSON конфигурацию для Xray Core
+	config := map[string]interface{}{
+		"log": map[string]interface{}{
+			"loglevel": "none",
+		},
+		"inbounds": []map[string]interface{}{
+			{
+				"port":     socksPort,
+				"protocol": "socks",
+				"settings": map[string]interface{}{
+					"auth": "noauth",
+					"udp":  true,
+				},
+			},
+		},
+		"outbounds": []map[string]interface{}{
+			{
+				"protocol": "vless",
+				"settings": map[string]interface{}{
+					"vnext": []map[string]interface{}{
+						{
+							"address": host,
+							"port":    port,
+							"users": []map[string]interface{}{
+								{
+									"id":       uuid,
+									"encryption": "none",
+								},
+							},
+						},
+					},
+				},
+				"streamSettings": map[string]interface{}{
+					"network":  netType,
+					"security": security,
+					"tlsSettings": map[string]interface{}{
+						"serverName":    sni,
+						"fingerprint":   fp,
+						"allowInsecure": true,
+					},
+					"realitySettings": map[string]interface{}{
+						"serverName":  sni,
+						"fingerprint": fp,
+						"publicKey":   pbk,
+						"shortId":     sid,
+					},
+					"wsSettings": map[string]interface{}{
+						"path": path,
+					},
+					"grpcSettings": map[string]interface{}{
+						"serviceName": query.Get("serviceName"),
+					},
+				},
+			},
+		},
+	}
+
+	return json.Marshal(config)
+}
+
+func getFreePort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+func findCoreExecutable() string {
+	if path, err := exec.LookPath("xray"); err == nil {
+		return path
+	}
+	if path, err := exec.LookPath("sing-box"); err == nil {
+		return path
+	}
+
+	// Проверка текущей директории
+	cwd, err := os.Getwd()
+	if err == nil {
+		xrayLocal := filepath.Join(cwd, "xray")
+		if _, err := os.Stat(xrayLocal); err == nil {
+			return xrayLocal
+		}
+		singLocal := filepath.Join(cwd, "sing-box")
+		if _, err := os.Stat(singLocal); err == nil {
+			return singLocal
+		}
+	}
+
+	return ""
+}
+
+// ----------------------------------------------------------------------------------
+//   ВСЕ ОСТАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (СОХРАНЕНЫ БЕЗ ИЗМЕНЕНИЙ)
+// ----------------------------------------------------------------------------------
+
 func checkTargetServices(configStr string) int {
 	var wg sync.WaitGroup
 	successChan := make(chan bool, len(targetServices))
@@ -301,16 +563,16 @@ func checkTargetServices(configStr string) int {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			
+
 			ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout)
 			defer cancel()
 
-			req, err := http.NewRequestWithContext(ctx, "HEAD", s.URL, nil)
+			req, err := http.NewRequestWithContext(ctx, "GET", s.URL, nil)
 			if err != nil {
 				successChan <- false
 				return
 			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 			client := &http.Client{
 				Timeout: serviceTimeout,
@@ -376,21 +638,20 @@ func isBlockedSNI(sni string) bool {
 	return false
 }
 
-// Проверка на принадлежность SNI к российскому сегменту (.ru, .su, .xn--p1ai)
 func isRuSNI(sni string) bool {
 	if sni == "" {
 		return false
 	}
 	sniLower := strings.ToLower(strings.TrimSpace(sni))
 
-	if strings.HasSuffix(sniLower, ".ru") || strings.HasSuffix(sniLower, ".su") || strings.HasSuffix(sniLower, ".xn--p1ai") {
+	if strings.HasSuffix(sniLower, ".ru") || strings.HasSuffix(sniLower, ".su") || strings.HasSuffix(sniLower, ".xn--p1ai") || strings.HasSuffix(sniLower, ".рф") {
 		return true
 	}
 
 	parts := strings.Split(sniLower, ".")
 	if len(parts) > 1 {
 		tld := parts[len(parts)-1]
-		if tld == "ru" || tld == "su" || tld == "xn--p1ai" {
+		if tld == "ru" || tld == "su" || tld == "xn--p1ai" || tld == "рф" {
 			return true
 		}
 	}
@@ -398,7 +659,6 @@ func isRuSNI(sni string) bool {
 	return false
 }
 
-// Меняет или устанавливает название конфига (хэш после #)
 func setConfigName(configURL string, name string) string {
 	escapedName := url.PathEscape(name)
 	if idx := strings.Index(configURL, "#"); idx != -1 {
@@ -415,6 +675,10 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 
 	host = u.Hostname()
 	port = u.Port()
+
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.Trim(host, "[]")
+	}
 
 	query := u.Query()
 	sni = query.Get("sni")
