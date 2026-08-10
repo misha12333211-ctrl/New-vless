@@ -8,3 +8,10 @@ https://relaxpanel.owadandomen.ru/sub/K7iQCLOIxoAzQmS4nrTNukIN
 https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat
 https://raw.githubusercontent.com/modrinthmodification-create/ownedvpn/main/subscription.txt
 https://raw.githubusercontent.com/luxxuria/harvester/refs/heads/main/non_ru.txt
+https://raw.githack.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+https://raw.githack.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+https://raw.githack.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt
+https://raw.githack.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt
+https://raw.githack.com/igareck/vpn-configs-for-russia/main/WHITE-SNI-RU-all.txt
+https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_lite.txt
+https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt
