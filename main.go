@@ -5,11 +5,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -26,12 +29,12 @@ import (
 )
 
 const (
-	timeout        = 3000 * time.Millisecond
-	serviceTimeout = 7000 * time.Millisecond
-	maxConcurrency = 100 // Оптимально для 2 vCPU без дропов сокетов
+	timeout        = 3500 * time.Millisecond
+	serviceTimeout = 8000 * time.Millisecond
+	maxConcurrency = 80  // Оптимизировано под 2 vCPU GitHub Actions
 	maxOutputLimit = 350 // Максимальное количество итоговых конфигов
 
-	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
+	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ (по умолчанию отключены) ---
 	StrictRuSNIOnly = false
 	StrictVLESSOnly = false
 	StrictPortsOnly = false
@@ -54,7 +57,7 @@ type TargetService struct {
 	URL  string
 }
 
-// 7 Обязательных сервисов
+// 7 Обязательных сервисов для обхода блокировок
 var mandatoryServiceNames = []string{
 	"Google", "YouTube", "Instagram", "Telegram", "WhatsApp", "Viber", "GitHub",
 }
@@ -72,17 +75,17 @@ var targetServices = []TargetService{
 	{Name: "DeepSeek", URL: "https://chat.deepseek.com"},
 }
 
-// РАСШИРЕННЫЙ СПИСОК РОССИЙСКИХ SNI И БЕЛЫХ ДОМЕНОВ (ТСПУ / Белые списки)
+// РАСШИРЕННЫЙ СПИСОК РОССИЙСКИХ SNI И БЕЛЫХ ДОМЕНОВ (ТСПУ / Белые списки 2026)
 var ruWhiteSNIs = []string{
 	// Экосистема VK & Mail.ru
-	"vk.com", "vk.me", "m.vk.com", "userapi.com", "vk-cdn.net", "mail.ru", "ok.ru", "my.games", "vkplay.ru",
+	"vk.com", "vk.me", "m.vk.com", "userapi.com", "vk-cdn.net", "mail.ru", "ok.ru", "my.games", "vkplay.ru", "vkcompany.ru",
 	// Экосистема Yandex
-	"yandex.ru", "ya.ru", "yastatic.net", "yandex.net", "kinopoisk.ru", "music.yandex.ru", "disk.yandex.ru",
+	"yandex.ru", "ya.ru", "yastatic.net", "yandex.net", "kinopoisk.ru", "music.yandex.ru", "disk.yandex.ru", "yandex.com",
 	// Банки и Финансы
 	"sberbank.ru", "sber.ru", "online.sberbank.ru", "tbank.ru", "tinkoff.ru", "vtb.ru", "alfabank.ru",
 	"cbr.ru", "open.ru", "raiffeisen.ru", "gazprombank.ru", "psbank.ru", "rshb.ru", "sovcombank.ru",
 	// Государственные ресурсы
-	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "pfr.gov.ru", "kremlin.ru", "customs.gov.ru",
+	"gosuslugi.ru", "mos.ru", "nalog.gov.ru", "pfr.gov.ru", "kremlin.ru", "customs.gov.ru", "sfr.gov.ru",
 	// Маркетплейсы и Ритейл
 	"ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "market.yandex.ru", "megamarket.ru", "dns-shop.ru",
 	"citilink.ru", "mvideo.ru", "eldorado.ru", "lamoda.ru", "sbermarket.ru", "vprok.ru", "magnit.ru", "5ka.ru",
@@ -94,7 +97,7 @@ var ruWhiteSNIs = []string{
 	"rutube.ru", "rambler.ru", "rbc.ru", "ria.ru", "lenta.ru", "gazeta.ru", "kommersant.ru", "tass.ru",
 	"iz.ru", "vedomosti.ru", "rg.ru", "dzen.ru", "smotrim.ru", "1tv.ru", "ntv.ru", "matchtv.ru",
 	// Промышленность, Транспорт и ИТ
-	"rzd.ru", "aeroflot.ru", "nornickel.ru", "gazprom.ru", "rosneft.ru", "lukoil.ru", "habr.com", "3dnews.ru",
+	"rzd.ru", "aeroflot.ru", "nornickel.ru", "gazprom.ru", "rosneft.ru", "lukoil.ru", "habr.com", "3dnews.ru", "vk.ru",
 }
 
 func main() {
@@ -119,20 +122,20 @@ func main() {
 	var wg sync.WaitGroup
 
 	sharedHTTPClient := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 18 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 			MaxIdleConns:          10000,
 			MaxIdleConnsPerHost:   1000,
 			IdleConnTimeout:       45 * time.Second,
-			ResponseHeaderTimeout: 12 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
 			DisableKeepAlives:     false,
 		},
 	}
 
 	for _, src := range sources {
 		src = strings.TrimSpace(src)
-		if src == "" || strings.HasPrefix(src, "#") {
+		if src == "" || strings.HasPrefix(src, "#") || strings.HasPrefix(src, "//") {
 			continue
 		}
 		wg.Add(1)
@@ -149,7 +152,7 @@ func main() {
 
 	uniqueConfigs := make(map[string]bool)
 	for cfg := range rawConfigs {
-		cfg = strings.TrimSpace(cfg)
+		cfg = sanitizeProxyURL(cfg)
 		if cfg != "" && len(cfg) < 8192 && isProxyProtocol(cfg) {
 			uniqueConfigs[cfg] = true
 		}
@@ -302,7 +305,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	lowerCfg := strings.ToLower(configStr)
 
-	if StrictPortsOnly && port != "443" && port != "80" && port != "8443" && port != "2053" && port != "2083" {
+	if StrictPortsOnly && port != "443" && port != "80" && port != "8443" && port != "2053" && port != "2083" && port != "2087" && port != "2096" {
 		return ConfigResult{}, false
 	}
 
@@ -328,7 +331,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	latency := time.Since(start)
-	isReality := strings.Contains(lowerCfg, "security=reality")
+	isReality := strings.Contains(lowerCfg, "security=reality") || strings.Contains(lowerCfg, "pbk=")
 	ruSNI := isRuSNI(sni)
 	noSNI := isNoSNI(sni, host)
 	score := calculateBypassScore(configStr, port, sni, transport, latency, passedServices)
@@ -348,19 +351,19 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	ruSNI := isRuSNI(sni)
-	isReality := strings.Contains(lowerCfg, "security=reality")
+	isReality := strings.Contains(lowerCfg, "security=reality") || strings.Contains(lowerCfg, "pbk=")
 	isTLS := strings.Contains(lowerCfg, "security=tls")
 
-	// Разрешаем порты 80, 443, 8080, 8443, 2053, 2083, 2096 для обхода типичных сетевых фильтров
+	// Разрешаем порты для обхода сетевых фильтров
 	validPorts := map[string]bool{
-		"80": true, "443": true, "8080": true, "8443": true, "2053": true, "2083": true, "2096": true, "4433": true,
+		"80": true, "443": true, "8080": true, "8443": true, "2053": true, "2083": true, "2087": true, "2096": true, "4433": true, "8000": true, "8880": true,
 	}
 
 	if !isTLS && !isReality && !validPorts[port] {
 		return false
 	}
 
-	// Отсекаем голые Shadowsocks на нестандартных портах без мимикрии
+	// Отсекаем старые Shadowsocks без обертки
 	if (proto == "ss" || proto == "ssr") && !ruSNI && !isReality && !validPorts[port] {
 		return false
 	}
@@ -381,13 +384,19 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 	return true
 }
 
-func getFreeLocalPort() (int, net.Listener, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, nil, err
+func getFreeLocalPort() (int, error) {
+	// Безопасный подбор свободного порта в диапазоне 20000-45000
+	for i := 0; i < 20; i++ {
+		n, _ := rand.Int(rand.Reader, big.NewInt(25000))
+		port := int(n.Int64()) + 20000
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		l, err := net.Listen("tcp", addr)
+		if err == nil {
+			_ = l.Close()
+			return port, nil
+		}
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	return port, listener, nil
+	return 0, fmt.Errorf("no free port found")
 }
 
 func checkTargetServicesViaProxy(configStr string) (int, bool) {
@@ -396,22 +405,8 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
-	// Безопасное выделение порта с предотвращением race-condition
-	var socksPort int
-	var listener net.Listener
-	var err error
-
-	for i := 0; i < 5; i++ {
-		socksPort, listener, err = getFreeLocalPort()
-		if err == nil {
-			_ = listener.Close() // Высвобождаем прямо перед передачей в Xray
-			time.Sleep(2 * time.Millisecond)
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if socksPort == 0 {
+	socksPort, err := getFreeLocalPort()
+	if err != nil {
 		return 0, false
 	}
 
@@ -425,6 +420,9 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	cmd := exec.CommandContext(ctx, corePath, "run", "-c", "stdin:")
 	cmd.Stdin = bytes.NewReader(xrayConfigJSON)
+
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
 		return 0, false
@@ -440,14 +438,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
 
-	for i := 0; i < 50; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
+	for i := 0; i < 60; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -465,7 +463,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   serviceTimeout - (800 * time.Millisecond),
+		Timeout:   serviceTimeout - (1000 * time.Millisecond),
 	}
 
 	var wg sync.WaitGroup
@@ -579,11 +577,15 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 			"spiderX":     "/",
 		}
 	} else if security == "tls" {
-		streamSettings["tlsSettings"] = map[string]interface{}{
+		tlsSettings := map[string]interface{}{
 			"serverName":    sni,
 			"fingerprint":   fp,
 			"allowInsecure": true,
 		}
+		if alpn := query.Get("alpn"); alpn != "" {
+			tlsSettings["alpn"] = strings.Split(alpn, ",")
+		}
+		streamSettings["tlsSettings"] = tlsSettings
 	}
 
 	if netType == "ws" {
@@ -637,13 +639,17 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 			},
 		}
 	case "hysteria2", "hy2":
-		outboundProtocol = "hysteria2"
+		outboundProtocol = "vless" // Обертка совместимости
+		userSettings := map[string]interface{}{
+			"id":         uuid,
+			"encryption": "none",
+		}
 		outboundSettings = map[string]interface{}{
-			"servers": []map[string]interface{}{
+			"vnext": []map[string]interface{}{
 				{
 					"address": host,
 					"port":    port,
-					"auth":    uuid,
+					"users":   []map[string]interface{}{userSettings},
 				},
 			},
 		}
@@ -824,11 +830,27 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 }
 
 func decodeSubscriptionContent(content string, out chan<- string) {
+	// Очищаем UTF-8 BOM
+	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
 	content = strings.TrimSpace(content)
 
-	// Пробуем многоуровневое раскодирование Base64
-	if decoded, err := decodeBase64Flex(cleanBase64Fast(content)); err == nil && len(decoded) > 0 {
-		content = string(decoded)
+	// Многоуровневое декодирование Base64
+	for i := 0; i < 3; i++ {
+		cleaned := cleanBase64Fast(content)
+		if len(cleaned) < 16 {
+			break
+		}
+		decoded, err := decodeBase64Flex(cleaned)
+		if err == nil && len(decoded) > 0 {
+			strDec := string(decoded)
+			if isProxyProtocol(strDec) || strings.Contains(strDec, "://") {
+				content = strDec
+			} else {
+				break
+			}
+		} else {
+			break
+		}
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(content))
@@ -839,10 +861,15 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 		line := strings.TrimSpace(scanner.Text())
 		if isProxyProtocol(line) {
 			out <- line
-		} else if strings.HasPrefix(line, "ss://") || strings.HasPrefix(line, "vmess://") {
-			out <- line
 		}
 	}
+}
+
+func sanitizeProxyURL(u string) string {
+	u = strings.TrimSpace(u)
+	u = strings.ReplaceAll(u, "\r", "")
+	u = strings.ReplaceAll(u, "\n", "")
+	return u
 }
 
 func cleanBase64Fast(s string) string {
@@ -895,7 +922,7 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 		score += 350 // Высокий приоритет для Белых Списков
 	}
 
-	if strings.Contains(lower, "security=reality") {
+	if strings.Contains(lower, "security=reality") || strings.Contains(lower, "pbk=") {
 		score += 300
 	}
 
@@ -941,16 +968,18 @@ func isNoSNI(sni string, host string) bool {
 }
 
 func setConfigName(configURL string, name string) string {
-	escapedName := url.PathEscape(name)
 	if idx := strings.Index(configURL, "#"); idx != -1 {
-		return configURL[:idx] + "#" + escapedName
+		return configURL[:idx] + "#" + url.QueryEscape(name)
 	}
-	return configURL + "#" + escapedName
+	return configURL + "#" + url.QueryEscape(name)
 }
 
 func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string) {
 	if strings.HasPrefix(configStr, "vmess://") {
 		b64 := configStr[8:]
+		if idx := strings.Index(b64, "#"); idx != -1 {
+			b64 = b64[:idx]
+		}
 		decoded, err := decodeBase64Flex(b64)
 		if err == nil {
 			var vmap map[string]interface{}
