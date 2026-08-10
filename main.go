@@ -22,13 +22,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	timeout        = 3 * time.Second
-	serviceTimeout = 5 * time.Second
-	maxConcurrency = 30  // Оптимально для GitHub Actions Runner
+	timeout        = 2500 * time.Millisecond
+	serviceTimeout = 4000 * time.Millisecond
+	maxConcurrency = 60  // Увеличено для максимального ускорения на Runner
 	maxOutputLimit = 300 // Лимит итоговых конфигов ровно 300
 
 	// --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
@@ -92,16 +93,16 @@ func main() {
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
 	fmt.Println("=== [2/5] Сбор и декодирование прокси-конфигураций ===")
 
-	rawConfigs := make(chan string, 200000)
+	rawConfigs := make(chan string, 500000)
 	var wg sync.WaitGroup
 
 	sharedHTTPClient := &http.Client{
-		Timeout: 20 * time.Second,
+		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:        500,
-			MaxIdleConnsPerHost: 50,
-			IdleConnTimeout:     45 * time.Second,
+			MaxIdleConns:        1000,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     30 * time.Second,
 		},
 	}
 
@@ -130,15 +131,15 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Собрано %d уникальных валидных прокси-ссылок.\n", len(uniqueConfigs))
-	fmt.Println("=== [3/5] Запуск многопоточной ТСПУ & Service валидации ===")
+	totalConfigs := len(uniqueConfigs)
+	fmt.Printf("Собрано %d уникальных валидных прокси-ссылок.\n", totalConfigs)
+	fmt.Println("=== [3/5] Запуск высокоскоростной ТСПУ & Service валидации ===")
 
-	resultsChan := make(chan ConfigResult, len(uniqueConfigs))
+	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
 
-	processedCount := 0
-	var countMu sync.Mutex
+	var processedCount int64
 
 	for cfg := range uniqueConfigs {
 		testWg.Add(1)
@@ -151,12 +152,10 @@ func main() {
 				resultsChan <- res
 			}
 
-			countMu.Lock()
-			processedCount++
-			if processedCount%100 == 0 || processedCount == len(uniqueConfigs) {
-				fmt.Printf("Проверено: %d / %d\r", processedCount, len(uniqueConfigs))
+			curr := atomic.AddInt64(&processedCount, 1)
+			if curr%100 == 0 || curr == int64(totalConfigs) {
+				fmt.Printf("Проверено: %d / %d\r", curr, totalConfigs)
 			}
-			countMu.Unlock()
 		}(cfg)
 	}
 
@@ -282,7 +281,7 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 50*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 100*1024*1024))
 	if err != nil {
 		return
 	}
@@ -290,7 +289,7 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	content := string(body)
 	cleanedContent := cleanBase64String(content)
 
-	if decoded, err := decodeBase64Flex(cleanedContent); err == nil {
+	if decoded, err := decodeBase64Flex(cleanedContent); err == nil && len(decoded) > 0 {
 		content = string(decoded)
 	}
 
@@ -374,6 +373,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	targetAddr := net.JoinHostPort(host, port)
 	start := time.Now()
 
+	// 1. Предварительный быстрейший TCP/TLS пинг
 	dialer := &net.Dialer{Timeout: timeout}
 	rawConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
@@ -429,6 +429,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	latency := time.Since(start)
 	_ = conn.Close()
 
+	// 2. Глубокий тест через Xray (только для выживших сокетов)
 	passedServices := checkTargetServicesViaProxy(configStr)
 
 	if passedServices == 0 {
@@ -467,7 +468,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 		return 0
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout*2)
+	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, corePath, "run", "-c", "stdin:")
@@ -488,14 +489,14 @@ func checkTargetServicesViaProxy(configStr string) int {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 30; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 50*time.Millisecond)
+	for i := 0; i < 15; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -517,7 +518,7 @@ func checkTargetServicesViaProxy(configStr string) int {
 	}
 
 	var wg sync.WaitGroup
-	successChan := make(chan bool, len(targetServices))
+	var successCount int64
 
 	for _, service := range targetServices {
 		wg.Add(1)
@@ -526,37 +527,24 @@ func checkTargetServicesViaProxy(configStr string) int {
 
 			req, err := http.NewRequestWithContext(ctx, "GET", s.URL, nil)
 			if err != nil {
-				successChan <- false
 				return
 			}
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 			resp, err := client.Do(req)
 			if err != nil {
-				successChan <- false
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-				successChan <- true
-			} else {
-				successChan <- false
+				atomic.AddInt64(&successCount, 1)
 			}
 		}(service)
 	}
 
 	wg.Wait()
-	close(successChan)
-
-	count := 0
-	for ok := range successChan {
-		if ok {
-			count++
-		}
-	}
-
-	return count
+	return int(atomic.LoadInt64(&successCount))
 }
 
 func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
@@ -736,7 +724,7 @@ func getFreeTCPListener() (net.Listener, int, error) {
 			port := l.Addr().(*net.TCPAddr).Port
 			return l, port, nil
 		}
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 	return nil, 0, fmt.Errorf("failed to allocate free port")
 }
@@ -908,7 +896,6 @@ func isNoSNI(sni string, host string) bool {
 	if sni == "" {
 		return true
 	}
-	// Если SNI совпадает с IP-адресом (т.е. нет доменного SNI)
 	if net.ParseIP(sni) != nil || net.ParseIP(host) != nil {
 		return true
 	}
