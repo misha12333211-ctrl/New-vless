@@ -18,14 +18,14 @@ import (
 )
 
 const (
-	timeout          = 4 * time.Second
-	serviceTimeout  = 5 * time.Second
-	maxConcurrency   = 60
-	maxOutputLimit   = 300
+	timeout        = 4 * time.Second
+	serviceTimeout = 5 * time.Second
+	maxConcurrency = 60
+	maxOutputLimit = 300
 
-	StrictWhitelistMode = true // Фильтрация по разрешенным SNI
-	StrictVLESSOnly     = true // Пропускать только VLESS (Reality/TLS)
-	StrictPortsOnly     = true // Пропускать только порты 443 и 80
+	StrictRuSNIOnly = true // Пропускать только российские SNI (.ru, .su, .рф)
+	StrictVLESSOnly = true // Пропускать только VLESS (Reality/TLS)
+	StrictPortsOnly = true // Пропускать только порты 443 и 80
 )
 
 type ConfigResult struct {
@@ -59,30 +59,6 @@ var blockedSNIs = []string{
 	"instagram.com", "facebook.com", "twitter.com", "x.com",
 	"ytimg.com", "ggpht.com", "googlevideo.com", "notion.so",
 	"t.me", "telegram.org",
-}
-
-// Белый список SNI (Рунет + крупные проверенные CDN)
-var trustedSNIs = []string{
-	"ya.ru", "yandex.ru", "yandex.com", "api-maps.yandex.ru", "avatars.mds.yandex.net",
-	"browser.yandex.ru", "dzen.ru", "kinopoisk.ru", "hd.kinopoisk.ru", "st.kinopoisk.ru",
-	"mail.yandex.ru", "mc.yandex.ru", "strm.yandex.ru", "travel.yandex.ru", "uslugi.yandex.ru",
-	"vk.com", "vk.ru", "m.vk.com", "api.vk.ru", "id.vk.ru", "login.vk.com",
-	"music.vk.ru", "cloud.vk.ru", "ads.vk.ru", "business.vk.ru", "target.vk.ru",
-	"userapi.com", "vk-portal.net", "mail.ru", "e.mail.ru", "go.mail.ru", "cloud.mail.ru",
-	"my.mail.ru", "news.mail.ru", "auto.mail.ru", "hi-tech.mail.ru", "otvet.mail.ru", "imgsmail.ru",
-	"avito.ru", "m.avito.ru", "avito.st", "ozon.ru", "www.ozon.ru", "bank.ozon.ru",
-	"seller.ozon.ru", "st.ozone.ru", "wb.ru", "a.wb.ru", "finance.wb.ru", "wildberries.ru", "lemanapro.ru",
-	"sberbank.ru", "online.sberbank.ru", "id.sber.ru", "tbank.ru", "id.tbank.ru",
-	"cdn.tbank.ru", "alfabank.ru", "alfa-mobile.alfabank.ru", "vtb.ru", "www.vtb.ru", "pochtabank.mail.ru",
-	"gosuslugi.ru", "esia.gosuslugi.ru", "lk.gosuslugi.ru", "pos.gosuslugi.ru", "nalog.gov.ru", "sfr.gov.ru",
-	"digital.gov.ru", "duma.gov.ru", "kremlin.ru", "roskachestvo.gov.ru", "pochta.ru", "izbirkom.ru", "mos.ru",
-	"2gis.ru", "2gis.com", "api.2gis.ru", "catalog.api.2gis.com", "tile0.maps.2gis.com",
-	"rzd.ru", "www.rzd.ru", "ticket.rzd.ru", "cargo.rzd.ru", "travel.rzd.ru", "tutu.ru",
-	"ok.ru", "m.ok.ru", "api.ok.ru", "st.okcdn.ru", "tamtam.ok.ru",
-	"rutube.ru", "static.rutube.ru", "rambler.ru", "lenta.ru", "rbc.ru", "kp.ru", "gazeta.ru",
-	"beeline.ru", "mts.ru", "megafon.ru", "tele2.ru", "yota.ru", "rt.ru", "rostelecom.ru",
-	"cloudflare.com", "microsoft.com", "apple.com", "amazon.com",
-	"yahoo.com", "zoom.us", "deb.debian.org", "cdn.jsdelivr.net",
 }
 
 func main() {
@@ -162,8 +138,10 @@ func main() {
 	}
 
 	var finalSlice []string
-	for _, r := range validResults {
-		finalSlice = append(finalSlice, r.URL)
+	for i, r := range validResults {
+		// Присваиваем имена вида SNI 1, SNI 2, SNI 3...
+		renamedURL := setConfigName(r.URL, fmt.Sprintf("SNI %d", i+1))
+		finalSlice = append(finalSlice, renamedURL)
 	}
 
 	fmt.Printf("Сформирован ТОП-%d максимальной надежности.\n", len(finalSlice))
@@ -222,7 +200,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	lowerCfg := strings.ToLower(configStr)
 
-	// 1. Фильтрация ТСПУ / Белые Списки
+	// 1. Фильтрация ТСПУ / Ru SNI
 	if StrictPortsOnly && port != "443" && port != "80" {
 		return ConfigResult{}, false
 	}
@@ -235,7 +213,8 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	if StrictWhitelistMode && !isTrustedSNI(sni) {
+	// Пропускать только конфигурации с Ru SNI (.ru, .su, .рф)
+	if StrictRuSNIOnly && !isRuSNI(sni) {
 		return ConfigResult{}, false
 	}
 
@@ -297,10 +276,9 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	latency := time.Since(start)
 	_ = conn.Close()
 
-	// 3. Параллельная проверка доступности целевых сервисов через туннель
+	// 3. Проверка доступности целевых сервисов
 	passedServices := checkTargetServices(configStr)
 	
-	// Если нужно требование 100% прохождения ВСЕХ сервисов из списка:
 	if passedServices < len(targetServices) {
 		return ConfigResult{}, false
 	}
@@ -316,10 +294,6 @@ func testConfig(configStr string) (ConfigResult, bool) {
 }
 
 func checkTargetServices(configStr string) int {
-	// Для честного туннелирования HTTP-запросов к сервисам (YouTube, Instagram, ChatGPT и т.д.)
-	// здесь подключается внутренний прокси-клиент (например, libbox / xray core).
-	// В данном блоке реализована параллельная обработка через WaitGroup для отбора готовых туннелей.
-
 	var wg sync.WaitGroup
 	successChan := make(chan bool, len(targetServices))
 
@@ -338,7 +312,6 @@ func checkTargetServices(configStr string) int {
 			}
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-			// При интеграции ядра прокси (sing-box / xray) клиент отправляет запрос через созданнный DialContext
 			client := &http.Client{
 				Timeout: serviceTimeout,
 			}
@@ -403,17 +376,35 @@ func isBlockedSNI(sni string) bool {
 	return false
 }
 
-func isTrustedSNI(sni string) bool {
+// Проверка на принадлежность SNI к российскому сегменту (.ru, .su, .xn--p1ai)
+func isRuSNI(sni string) bool {
 	if sni == "" {
 		return false
 	}
-	sniLower := strings.ToLower(sni)
-	for _, trusted := range trustedSNIs {
-		if strings.Contains(sniLower, trusted) {
+	sniLower := strings.ToLower(strings.TrimSpace(sni))
+
+	if strings.HasSuffix(sniLower, ".ru") || strings.HasSuffix(sniLower, ".su") || strings.HasSuffix(sniLower, ".xn--p1ai") {
+		return true
+	}
+
+	parts := strings.Split(sniLower, ".")
+	if len(parts) > 1 {
+		tld := parts[len(parts)-1]
+		if tld == "ru" || tld == "su" || tld == "xn--p1ai" {
 			return true
 		}
 	}
+
 	return false
+}
+
+// Меняет или устанавливает название конфига (хэш после #)
+func setConfigName(configURL string, name string) string {
+	escapedName := url.PathEscape(name)
+	if idx := strings.Index(configURL, "#"); idx != -1 {
+		return configURL[:idx] + "#" + escapedName
+	}
+	return configURL + "#" + escapedName
 }
 
 func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string) {
