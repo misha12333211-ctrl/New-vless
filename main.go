@@ -283,7 +283,7 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-Bypass-RU-%d", i+1))
+		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-Bypass-RU-%d Telegram: https://t.me/MiGiTi_official_channel", i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
