@@ -283,7 +283,7 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-Bypass-RU-%d Telegram: https://t.me/MiGiTi_official_channel", i+1))
+		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-Bypass-RU-%d | @MiGiTi_official_channel", i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
@@ -1006,11 +1006,11 @@ func isNoSNI(sni string, host string) bool {
 }
 
 func setConfigName(configURL string, name string) string {
-	safeName := strings.ReplaceAll(name, " ", "-")
+	escapedName := url.PathEscape(name)
 	if idx := strings.Index(configURL, "#"); idx != -1 {
-		return configURL[:idx] + "#" + safeName
+		return configURL[:idx] + "#" + escapedName
 	}
-	return configURL + "#" + safeName
+	return configURL + "#" + escapedName
 }
 
 func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string) {
