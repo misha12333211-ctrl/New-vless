@@ -69,24 +69,24 @@ var targetServices = []TargetService{
 
 // Список доменов "белого списка" ТСПУ и российских сервисов для SNI Mimicry
 var ruWhiteSNIs = []string{
-  'ya.ru', 'yandex.ru', 'yandex.com', 'api-maps.yandex.ru', 'avatars.mds.yandex.net',
-  'browser.yandex.ru', 'dzen.ru', 'kinopoisk.ru', 'hd.kinopoisk.ru', 'st.kinopoisk.ru',
-  'mail.yandex.ru', 'mc.yandex.ru', 'strm.yandex.ru', 'travel.yandex.ru', 'uslugi.yandex.ru',
-  'vk.com', 'vk.ru', 'm.vk.com', 'api.vk.ru', 'id.vk.ru', 'login.vk.com',
-  'music.vk.ru', 'cloud.vk.ru', 'ads.vk.ru', 'business.vk.ru', 'target.vk.ru',
-  'userapi.com', 'vk-portal.net', 'mail.ru', 'e.mail.ru', 'go.mail.ru', 'cloud.mail.ru', 
-  'my.mail.ru', 'news.mail.ru', 'auto.mail.ru', 'hi-tech.mail.ru', 'otvet.mail.ru', 'imgsmail.ru',
-  'avito.ru', 'm.avito.ru', 'avito.st', 'ozon.ru', 'www.ozon.ru', 'bank.ozon.ru',
-  'seller.ozon.ru', 'st.ozone.ru', 'wb.ru', 'a.wb.ru', 'finance.wb.ru', 'wildberries.ru', 'lemanapro.ru',
-  'sberbank.ru', 'online.sberbank.ru', 'id.sber.ru', 'tbank.ru', 'id.tbank.ru',
-  'cdn.tbank.ru', 'alfabank.ru', 'alfa-mobile.alfabank.ru', 'vtb.ru', 'www.vtb.ru', 'pochtabank.mail.ru',
-  'gosuslugi.ru', 'esia.gosuslugi.ru', 'lk.gosuslugi.ru', 'pos.gosuslugi.ru', 'nalog.gov.ru', 'sfr.gov.ru',
-  'digital.gov.ru', 'duma.gov.ru', 'kremlin.ru', 'roskachestvo.gov.ru', 'pochta.ru', 'izbirkom.ru', 'mos.ru',
-  '2gis.ru', '2gis.com', 'api.2gis.ru', 'catalog.api.2gis.com', 'tile0.maps.2gis.com',
-  'rzd.ru', 'www.rzd.ru', 'ticket.rzd.ru', 'cargo.rzd.ru', 'travel.rzd.ru',
-  'ok.ru', 'm.ok.ru', 'api.ok.ru', 'st.okcdn.ru', 'tamtam.ok.ru',
-  'rutube.ru', 'static.rutube.ru', 'rambler.ru', 'lenta.ru', 'rbc.ru', 'kp.ru', 'gazeta.ru', 'tutu.ru',
-  'beeline.ru', 'mts.ru', 'megafon.ru', 'tele2.ru', 'yota.ru', 'rt.ru', 'rostelecom.ru'
+  "ya.ru", "yandex.ru", "yandex.com", "api-maps.yandex.ru", "avatars.mds.yandex.net",
+"browser.yandex.ru", "dzen.ru", "kinopoisk.ru", "hd.kinopoisk.ru", "st.kinopoisk.ru",
+"mail.yandex.ru", "mc.yandex.ru", "strm.yandex.ru", "travel.yandex.ru", "uslugi.yandex.ru",
+"vk.com", "vk.ru", "m.vk.com", "api.vk.ru", "id.vk.ru", "login.vk.com",
+"music.vk.ru", "cloud.vk.ru", "ads.vk.ru", "business.vk.ru", "target.vk.ru",
+"userapi.com", "vk-portal.net", "mail.ru", "e.mail.ru", "go.mail.ru", "cloud.mail.ru",
+"my.mail.ru", "news.mail.ru", "auto.mail.ru", "hi-tech.mail.ru", "otvet.mail.ru", "imgsmail.ru",
+"avito.ru", "m.avito.ru", "avito.st", "ozon.ru", "www.ozon.ru", "bank.ozon.ru",
+"seller.ozon.ru", "st.ozone.ru", "wb.ru", "a.wb.ru", "finance.wb.ru", "wildberries.ru", "lemanapro.ru",
+"sberbank.ru", "online.sberbank.ru", "id.sber.ru", "tbank.ru", "id.tbank.ru",
+"cdn.tbank.ru", "alfabank.ru", "alfa-mobile.alfabank.ru", "vtb.ru", "www.vtb.ru", "pochtabank.mail.ru",
+"gosuslugi.ru", "esia.gosuslugi.ru", "lk.gosuslugi.ru", "pos.gosuslugi.ru", "nalog.gov.ru", "sfr.gov.ru",
+"digital.gov.ru", "duma.gov.ru", "kremlin.ru", "roskachestvo.gov.ru", "pochta.ru", "izbirkom.ru", "mos.ru",
+"2gis.ru", "2gis.com", "api.2gis.ru", "catalog.api.2gis.com", "tile0.maps.2gis.com",
+"rzd.ru", "www.rzd.ru", "ticket.rzd.ru", "cargo.rzd.ru", "travel.rzd.ru",
+"ok.ru", "m.ok.ru", "api.ok.ru", "st.okcdn.ru", "tamtam.ok.ru",
+"rutube.ru", "static.rutube.ru", "rambler.ru", "lenta.ru", "rbc.ru", "kp.ru", "gazeta.ru", "tutu.ru",
+"beeline.ru", "mts.ru", "megafon.ru", "tele2.ru", "yota.ru", "rt.ru", "rostelecom.ru"
 }
 
 // Страны с минимальной сетевой задержкой до провайдеров РФ (Ближнее гео)
