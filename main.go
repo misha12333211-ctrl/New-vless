@@ -86,7 +86,7 @@ var ruWhiteSNIs = []string{
 "rzd.ru", "www.rzd.ru", "ticket.rzd.ru", "cargo.rzd.ru", "travel.rzd.ru",
 "ok.ru", "m.ok.ru", "api.ok.ru", "st.okcdn.ru", "tamtam.ok.ru",
 "rutube.ru", "static.rutube.ru", "rambler.ru", "lenta.ru", "rbc.ru", "kp.ru", "gazeta.ru", "tutu.ru",
-"beeline.ru", "mts.ru", "megafon.ru", "tele2.ru", "yota.ru", "rt.ru", "rostelecom.ru"
+"beeline.ru", "mts.ru", "megafon.ru", "tele2.ru", "yota.ru", "rt.ru", "rostelecom.ru",
 }
 
 // Страны с минимальной сетевой задержкой до провайдеров РФ (Ближнее гео)
