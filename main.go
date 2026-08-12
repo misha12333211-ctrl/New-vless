@@ -59,8 +59,12 @@ var targetServices = []TargetService{
 	{Name: "Google", URL: "https://www.google.com/generate_204"},
 	{Name: "Telegram", URL: "https://t.me"},
 	{Name: "GitHub", URL: "https://github.com"},
-	{Name: "VK", URL: "https://vk.com"},
-	{Name: "Yandex", URL: "https://ya.ru"},
+	{Name: "YouTube", URL: "https://www.youtube.com"},
+	{Name: "Instagram", URL: "https://www.instagram.com"},
+	{Name: "WhatsApp", URL: "https://web.whatsapp.com"},
+	{Name: "Viber", URL: "https://www.viber.com"},
+	{Name: "Gemini", URL: "https://gemini.google.com"},
+	{Name: "ChatGPT", URL: "https://chatgpt.com"},
 }
 
 // Список доменов "белого списка" ТСПУ и российских сервисов для SNI Mimicry
