@@ -30,13 +30,14 @@ import (
 const (
 	maxConcurrency = 60                 // Оптимальный параллелизм для 2 vCPU GitHub Actions
 	maxOutputLimit = 350                // Количество серверов в итоговой подписке
-	pingTimeout    = 2000 * time.Millisecond // Таймаут измерения чистого TCP Handshake
+	pingTimeout    = 2500 * time.Millisecond // Таймаут измерения чистого TCP Handshake
 	serviceTimeout = 6000 * time.Millisecond // Таймаут проверки доступа к ресурсам через Xray
 )
 
 type ConfigResult struct {
 	URL            string
 	Latency        time.Duration
+	AdjustedPing   time.Duration // Скорректированный пинг относительно РФ
 	Score          int
 	ServiceSuccess int
 	SNI            string
@@ -56,12 +57,10 @@ type TargetService struct {
 // Популярные сервисы для проверки сквозного выхода в интернет
 var targetServices = []TargetService{
 	{Name: "Google", URL: "https://www.google.com/generate_204"},
-	{Name: "YouTube", URL: "https://www.youtube.com"},
 	{Name: "Telegram", URL: "https://t.me"},
 	{Name: "GitHub", URL: "https://github.com"},
-	{Name: "Instagram", URL: "https://www.instagram.com"},
-	{Name: "WhatsApp", URL: "https://web.whatsapp.com"},
-	{Name: "ChatGPT", URL: "https://chatgpt.com"},
+	{Name: "VK", URL: "https://vk.com"},
+	{Name: "Yandex", URL: "https://ya.ru"},
 }
 
 // Список доменов "белого списка" ТСПУ и российских сервисов для SNI Mimicry
@@ -74,7 +73,7 @@ var ruWhiteSNIs = []string{
 	"hh.ru", "habr.com", "rutube.ru", "rambler.ru", "rbc.ru", "ria.ru", "lenta.ru", "dzen.ru",
 }
 
-// Страны с минимальной сетевой задержкой до провайдеров РФ
+// Страны с минимальной сетевой задержкой до провайдеров РФ (Ближнее гео)
 var nearRUCountries = map[string]bool{
 	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
 	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
@@ -151,7 +150,7 @@ func main() {
 	totalConfigs := len(uniqueConfigs)
 	fmt.Printf("Успешно собрано %d уникальных прокси-ссылок.\n", totalConfigs)
 
-	fmt.Println("=== [3/5] Валидация под ТСПУ, измерение реального пинга и проверка сервисов ===")
+	fmt.Println("=== [3/5] Валидация под ТСПУ (Строгий RU-SNI / Near-RU), измерение пинга и сквозная проверка ===")
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
@@ -186,13 +185,16 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Сортировка и балансировка (Целевая доля ближнего гео / REALITY / RU-SNI ~90%%) (Валидных: %d) ===\n", len(validResults))
-	
+	fmt.Printf("=== [4/5] Сортировка и жесткая квота (~90%% Ближнее Гео / RU-SNI / REALITY) (Валидных: %d) ===\n", len(validResults))
+
 	var priorityGroup []ConfigResult
 	var secondaryGroup []ConfigResult
 
 	for _, res := range validResults {
-		if res.IsNearRU || res.IsRuSNI || res.IsReality || res.IsNoSNI {
+		// Приоритетная группа: Ближнее гео (РФ и соседи) С ОБЯЗАТЕЛЬНЫМ RU-SNI / REALITY / NoSNI
+		if res.IsNearRU && (res.IsRuSNI || res.IsReality || res.IsNoSNI) {
+			priorityGroup = append(priorityGroup, res)
+		} else if res.IsNearRU || res.IsRuSNI || res.IsReality {
 			priorityGroup = append(priorityGroup, res)
 		} else {
 			secondaryGroup = append(secondaryGroup, res)
@@ -203,7 +205,7 @@ func main() {
 		sort.Slice(slice, func(i, j int) bool {
 			if slice[i].ServiceSuccess == slice[j].ServiceSuccess {
 				if slice[i].Score == slice[j].Score {
-					return slice[i].Latency < slice[j].Latency
+					return slice[i].AdjustedPing < slice[j].AdjustedPing
 				}
 				return slice[i].Score > slice[j].Score
 			}
@@ -214,7 +216,7 @@ func main() {
 	sortByQuality(priorityGroup)
 	sortByQuality(secondaryGroup)
 
-	fmt.Printf("Категории: [Приоритет (Близкий Гео / RU-SNI / REALITY): %d] | [Прочие: %d]\n", len(priorityGroup), len(secondaryGroup))
+	fmt.Printf("Категории: [Приоритет (Near-RU + RU-SNI / REALITY): %d] | [Прочие: %d]\n", len(priorityGroup), len(secondaryGroup))
 
 	var selected []ConfigResult
 	usedMap := make(map[string]bool)
@@ -231,13 +233,13 @@ func main() {
 		return false
 	}
 
-	// Заполнение 90% квоты приоритетными узлами с низким пингом
+	// 1. Строгая забивка 90% квоты (минимум 315 из 350 серверов) из PriorityGroup (Ближнее гео / RU-SNI)
 	targetQuota := (maxOutputLimit * 90) / 100
 	for i := 0; i < len(priorityGroup) && len(selected) < targetQuota; i++ {
 		addUnique(priorityGroup[i])
 	}
 
-	// Заполнение остатка до 100%
+	// 2. Добираем остаток приоритетными, затем остальными
 	for _, res := range priorityGroup {
 		addUnique(res)
 	}
@@ -247,7 +249,7 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		tag := "Fast-RU"
+		tag := "RU-Fast"
 		if r.CountryCode != "" {
 			tag = fmt.Sprintf("%s-Bypass", r.CountryCode)
 		}
@@ -274,35 +276,49 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	lowerCfg := strings.ToLower(configStr)
+	ruSNI := isRuSNI(sni)
+	noSNI := isNoSNI(sni, host)
+	isReality := strings.Contains(lowerCfg, "security=reality") || strings.Contains(lowerCfg, "pbk=")
 
-	// 1. Предварительная отбраковка заблокированных ТСПУ конфигураций
+	// Жесткое условие ТСПУ: Отбрасываем ВСЕ узлы с иностранными SNI, если это TLS/WS/gRPC без REALITY
+	if !isReality && !noSNI && !ruSNI {
+		return ConfigResult{}, false
+	}
+
+	// 1. Предварительная проверка совместимости с блокировками ТСПУ
 	if !simulateTSPUBypassCheck(proto, port, sni, lowerCfg) {
 		return ConfigResult{}, false
 	}
 
-	// 2. Точное измерение чистого сетевого пинга до узла (TCP Dial)
+	// 2. Измерение чистого сетевого пинга до узла (TCP Dial)
 	realPing, ok := measureTCPPing(host, port)
 	if !ok || realPing > pingTimeout {
 		return ConfigResult{}, false
 	}
 
-	// 3. Проверка функциональности через локальный процесс Xray Core
+	// 3. Проверка функциональности через локальный Xray Core
 	passedServices, ok := checkTargetServicesViaProxy(configStr)
-	if !ok || passedServices < 1 { // Сервер должен открывать хотя бы 1 ключевой сервис
+	if !ok || passedServices < 1 {
 		return ConfigResult{}, false
 	}
 
 	countryCode := getIPCountryCode(host)
 	isNearRU := nearRUCountries[countryCode]
-	isReality := strings.Contains(lowerCfg, "security=reality") || strings.Contains(lowerCfg, "pbk=")
-	ruSNI := isRuSNI(sni)
-	noSNI := isNoSNI(sni, host)
 
-	score := calculateBypassScore(configStr, port, sni, transport, realPing, passedServices, isNearRU)
+	// Коррекция сетевого пинга с учетом размещения GitHub vs Реальность РФ
+	adjustedPing := realPing
+	if countryCode == "RU" {
+		adjustedPing = time.Duration(float64(realPing) * 0.3) // РФ серверы для пользователей из РФ дают 10-40мс
+	} else if isNearRU {
+		adjustedPing = time.Duration(float64(realPing) * 0.6)
+	}
+
+	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, countryCode)
 
 	return ConfigResult{
 		URL:            configStr,
 		Latency:        realPing,
+		AdjustedPing:   adjustedPing,
 		Score:          score,
 		ServiceSuccess: passedServices,
 		SNI:            sni,
@@ -340,23 +356,11 @@ func simulateTSPUBypassCheck(proto, port, sni, lowerCfg string) bool {
 		return false
 	}
 
-	// Блокировка стандартного Shadowsocks на нестандартных портах (мгновенно банится ТСПУ)
+	// Блокировка стандартных SS/SSR на нестандартных портах (ТСПУ сразу детектит)
 	if (proto == "ss" || proto == "ssr") && !ruSNI && !isReality && !validPorts[port] {
 		return false
 	}
 
-	// Фильтрация известных заблокированных зарубежных SNI при обычном TLS
-	if isTLS && !isReality && !ruSNI {
-		blockedSNIs := []string{
-			"cloudflare.com", "cloudfront.net", "facebook.com", "instagram.com",
-			"twitter.com", "netflix.com", "bbc.com",
-		}
-		for _, b := range blockedSNIs {
-			if strings.Contains(sni, b) {
-				return false
-			}
-		}
-	}
 	return true
 }
 
@@ -364,12 +368,12 @@ func getFreeLocalPort() (int, error) {
 	portMutex.Lock()
 	defer portMutex.Unlock()
 
-	for i := 0; i < 100; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(20000))
+	for i := 0; i < 150; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(25000))
 		if err != nil {
 			continue
 		}
-		port := int(n.Int64()) + 25000
+		port := int(n.Int64()) + 20000
 		if usedPorts[port] {
 			continue
 		}
@@ -380,7 +384,7 @@ func getFreeLocalPort() (int, error) {
 			_ = l.Close()
 			usedPorts[port] = true
 			go func(p int) {
-				time.Sleep(3 * time.Second)
+				time.Sleep(2 * time.Second)
 				portMutex.Lock()
 				delete(usedPorts, p)
 				portMutex.Unlock()
@@ -428,14 +432,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 40; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
+	for i := 0; i < 30; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -453,7 +457,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   2500 * time.Millisecond,
+		Timeout:   2200 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
@@ -463,7 +467,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 2000*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 1800*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
@@ -925,13 +929,17 @@ func getIPCountryCode(host string) string {
 	return ""
 }
 
-func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool) int {
-	score := 100 + (passedServices * 120)
+func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string) int {
+	score := 100 + (passedServices * 150)
 	lower := strings.ToLower(configStr)
 
-	if isNearRU {
-		score += 600
+	// Максимальный бал серверу в РФ или Ближнем гео
+	if countryCode == "RU" {
+		score += 1000
+	} else if isNearRU {
+		score += 650
 	}
+
 	if isRuSNI(sni) {
 		score += 500
 	}
@@ -945,7 +953,7 @@ func calculateBypassScore(configStr string, port string, sni string, transport s
 	}
 
 	pingMs := int(latency.Milliseconds())
-	score -= pingMs * 2 // Жесткий штраф за высокую задержку
+	score -= pingMs * 2 // Штраф за задержку
 	return score
 }
 
