@@ -3,7 +3,6 @@ package main
 import (
 	"archive/zip"
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
