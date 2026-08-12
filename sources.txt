@@ -25,3 +25,4 @@ https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/c
 https://raw.githubusercontent.com/flaafix/AetrisVPN-white-list-lite/refs/heads/main/AetrisVPN.txt
 https://sub.vlessfo.ru/vlessforu/working_configs.txt
 https://raw.githubusercontent.com/bskertt-cmd/vpn-has/refs/heads/main/keys.txt
+https://gist.githubusercontent.com/LIKE-FURRY/bbfa45823f207e87f9fe0f5d9247e7c8/raw/87ecd3cf75035979da6ce936605954d3aa1e36de/ALL-VPS-PRO-SLIV-JSON-ORIG
