@@ -27,10 +27,10 @@ import (
 )
 
 const (
-	maxConcurrency = 50                 // Оптимальный параллелизм для runner 2 vCPU GitHub Actions
-	maxOutputLimit = 350                // Количество серверов в итоговой подписке
-	pingTimeout    = 2500 * time.Millisecond // Таймаут измерений TCP
-	serviceTimeout = 8000 * time.Millisecond // Таймаут поднятия Xray + проверки сервисов
+	maxConcurrency = 35                 // Оптимально для 2 vCPU GitHub Actions
+	maxOutputLimit = 350                // Лимит серверов в подписке
+	pingTimeout    = 2000 * time.Millisecond
+	serviceTimeout = 7000 * time.Millisecond
 )
 
 type ConfigResult struct {
@@ -44,6 +44,7 @@ type ConfigResult struct {
 	CountryCode    string
 	IsNearRU       bool
 	IsRuSNI        bool
+	HasBypassTech  bool
 }
 
 type TargetService struct {
@@ -51,7 +52,7 @@ type TargetService struct {
 	URL  string
 }
 
-// Популярные сервисы для проверки сквозного выхода в интернет
+// 7+ Ключевых сервисов для проверки реальной работоспособности
 var targetServices = []TargetService{
 	{Name: "Google", URL: "https://www.google.com/generate_204"},
 	{Name: "Telegram", URL: "https://t.me"},
@@ -59,11 +60,10 @@ var targetServices = []TargetService{
 	{Name: "YouTube", URL: "https://www.youtube.com"},
 	{Name: "Instagram", URL: "https://www.instagram.com"},
 	{Name: "WhatsApp", URL: "https://web.whatsapp.com"},
-	{Name: "Gemini", URL: "https://gemini.google.com"},
 	{Name: "ChatGPT", URL: "https://chatgpt.com"},
 }
 
-// Домены "белого списка" ТСПУ и российских сервисов для гарантированного обхода
+// Список проверенных SNI из "Белого списка" ТСПУ
 var ruWhiteSNIs = []string{
 	"ya.ru", "yandex.ru", "yandex.com", "api-maps.yandex.ru", "avatars.mds.yandex.net",
 	"browser.yandex.ru", "dzen.ru", "kinopoisk.ru", "hd.kinopoisk.ru", "st.kinopoisk.ru",
@@ -71,21 +71,12 @@ var ruWhiteSNIs = []string{
 	"vk.com", "vk.ru", "m.vk.com", "api.vk.ru", "id.vk.ru", "login.vk.com",
 	"music.vk.ru", "cloud.vk.ru", "ads.vk.ru", "business.vk.ru", "target.vk.ru",
 	"userapi.com", "vk-portal.net", "mail.ru", "e.mail.ru", "go.mail.ru", "cloud.mail.ru",
-	"my.mail.ru", "news.mail.ru", "auto.mail.ru", "hi-tech.mail.ru", "otvet.mail.ru", "imgsmail.ru",
-	"avito.ru", "m.avito.ru", "avito.st", "ozon.ru", "www.ozon.ru", "bank.ozon.ru",
-	"seller.ozon.ru", "st.ozone.ru", "wb.ru", "a.wb.ru", "finance.wb.ru", "wildberries.ru", "lemanapro.ru",
-	"sberbank.ru", "online.sberbank.ru", "id.sber.ru", "tbank.ru", "id.tbank.ru",
-	"cdn.tbank.ru", "alfabank.ru", "alfa-mobile.alfabank.ru", "vtb.ru", "www.vtb.ru", "pochtabank.mail.ru",
-	"gosuslugi.ru", "esia.gosuslugi.ru", "lk.gosuslugi.ru", "pos.gosuslugi.ru", "nalog.gov.ru", "sfr.gov.ru",
-	"digital.gov.ru", "duma.gov.ru", "kremlin.ru", "roskachestvo.gov.ru", "pochta.ru", "izbirkom.ru", "mos.ru",
-	"2gis.ru", "2gis.com", "api.2gis.ru", "catalog.api.2gis.com", "tile0.maps.2gis.com",
-	"rzd.ru", "www.rzd.ru", "ticket.rzd.ru", "cargo.rzd.ru", "travel.rzd.ru",
-	"ok.ru", "m.ok.ru", "api.ok.ru", "st.okcdn.ru", "tamtam.ok.ru",
-	"rutube.ru", "static.rutube.ru", "rambler.ru", "lenta.ru", "rbc.ru", "kp.ru", "gazeta.ru", "tutu.ru",
-	"beeline.ru", "mts.ru", "megafon.ru", "tele2.ru", "yota.ru", "rt.ru", "rostelecom.ru",
+	"avito.ru", "m.avito.ru", "ozon.ru", "wb.ru", "wildberries.ru",
+	"sberbank.ru", "tbank.ru", "alfabank.ru", "vtb.ru", "gosuslugi.ru", "mos.ru",
+	"2gis.ru", "rutube.ru", "rambler.ru", "rbc.ru", "mts.ru", "megafon.ru", "beeline.ru",
 }
 
-// Страны с минимальной задержкой до РФ
+// Страны с отличными каналами до РФ
 var nearRUCountries = map[string]bool{
 	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
 	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
@@ -104,19 +95,19 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	startTime := time.Now()
 
-	fmt.Println("=== [1/5] Подготовка рабочего окружения и бинарника Xray Core ===")
+	fmt.Println("=== [1/5] Подготовка среды и Xray Core ===")
 	ensureCoreAvailable()
 
 	sources, err := readLines("sources.txt")
 	if err != nil {
-		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые файлы подписок.\n", err)
+		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые файлы.\n", err)
 		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
-	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
+	fmt.Printf("Загружено источников: %d\n", len(sources))
 
-	fmt.Println("=== [2/5] Сбор и декодирование прокси-конфигураций ===")
+	fmt.Println("=== [2/5] Сбор и уникализация конфигураций ===")
 	rawConfigs := make(chan string, 500000)
 	var wg sync.WaitGroup
 
@@ -160,9 +151,9 @@ func main() {
 	}
 
 	totalConfigs := len(uniqueConfigs)
-	fmt.Printf("Успешно собрано %d уникальных прокси-ссылок.\n", totalConfigs)
+	fmt.Printf("Уникальных прокси-ссылок: %d\n", totalConfigs)
 
-	fmt.Println("=== [3/5] Строгая фильтрация под ТСПУ (ТОЛЬКО RU-SNI) и проверка работы ===")
+	fmt.Println("=== [3/5] Умное тестирование обхода ТСПУ и сервисов ===")
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
@@ -181,14 +172,14 @@ func main() {
 
 			curr := atomic.AddInt64(&processedCount, 1)
 			if curr%500 == 0 || curr == int64(totalConfigs) {
-				fmt.Printf("Проверено узлов: %d / %d\r", curr, totalConfigs)
+				fmt.Printf("Проверено: %d / %d\r", curr, totalConfigs)
 			}
 		}(cfg)
 	}
 
 	testWg.Wait()
 	close(resultsChan)
-	fmt.Println("\nТестирование всех узлов завершено.")
+	fmt.Println("\nТестирование завершено.")
 
 	var validResults []ConfigResult
 	for res := range resultsChan {
@@ -197,8 +188,9 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Сортировка серверов с RU-SNI (Валидных с RU-SNI: %d) ===\n", len(validResults))
+	fmt.Printf("=== [4/5] Ранжирование и отбор рабочих серверов (Валидных: %d) ===\n", len(validResults))
 
+	// Приоритет: Количество рабочих сервисов -> Скор обхода ТСПУ -> Мин. задержка
 	sort.Slice(validResults, func(i, j int) bool {
 		if validResults[i].ServiceSuccess == validResults[j].ServiceSuccess {
 			if validResults[i].Score == validResults[j].Score {
@@ -224,52 +216,56 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		tag := "RU-SNI"
-		if r.CountryCode != "" {
-			tag = fmt.Sprintf("%s-RUSNI", r.CountryCode)
+		tag := "BYPASS"
+		if r.IsRuSNI {
+			tag = "RU-SNI"
+		} else if r.HasBypassTech {
+			tag = "ANTI-TSPU"
 		}
+
+		if r.CountryCode != "" {
+			tag = fmt.Sprintf("%s-%s", r.CountryCode, tag)
+		}
+
 		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-%s-%d | @MiGiTi_official_channel", tag, i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-	fmt.Printf("Сформирован итоговый список из %d строго валидных RU-SNI серверов.\n", len(finalSlice))
+	fmt.Printf("Итоговая подписка сформирована: %d серверов.\n", len(finalSlice))
 
-	fmt.Println("=== [5/5] Запись файлов подписки ===")
+	fmt.Println("=== [5/5] Сохранение подписок ===")
 	rawOutput := strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
-	fmt.Printf("Процесс успешно завершен за %v! Выходные файлы созданы.\n", time.Since(startTime))
+	fmt.Printf("Успешно завершено за %v!\n", time.Since(startTime))
 }
 
 func testConfig(configStr string) (ConfigResult, bool) {
-	host, port, sni, _, transport, proto := parseConfigDetails(configStr)
+	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
 	if host == "" || port == "" {
 		return ConfigResult{}, false
 	}
 
-	// СТРОГОЕ ТРЕБОВАНИЕ: ТОЛЬКО Российские SNI (Яндекс, VK, Госуслуги, Mail.ru и т.д.)
 	ruSNI := isRuSNI(sni)
-	if !ruSNI {
-		return ConfigResult{}, false
-	}
+	hasBypassTech := security == "reality" || proto == "hysteria2" || proto == "hy2" || proto == "tuic" || flow != ""
 
-	// 1. Предварительная проверка портов
+	// 1. Предварительная проверка порта и протокола на явные блокировки
 	if !simulateTSPUBypassCheck(proto, port, sni) {
 		return ConfigResult{}, false
 	}
 
-	// 2. Измерение сетевого пинга до узла
+	// 2. TCP Ping
 	realPing, ok := measureTCPPing(host, port)
 	if !ok || realPing > pingTimeout {
 		return ConfigResult{}, false
 	}
 
-	// 3. Проверка реального соединения через Xray Core с фрагментацией
+	// 3. Сквозная проверка через Xray Core
 	passedServices, ok := checkTargetServicesViaProxy(configStr)
-	if !ok || passedServices < 1 {
+	if !ok || passedServices < 1 { // Требуем хотя бы 1 рабочий сервис из GitHub Actions
 		return ConfigResult{}, false
 	}
 
@@ -283,7 +279,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		adjustedPing = time.Duration(float64(realPing) * 0.6)
 	}
 
-	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, countryCode)
+	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, countryCode, ruSNI, hasBypassTech)
 
 	return ConfigResult{
 		URL:            configStr,
@@ -295,7 +291,8 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		Protocol:       proto,
 		CountryCode:    countryCode,
 		IsNearRU:       isNearRU,
-		IsRuSNI:        true,
+		IsRuSNI:        ruSNI,
+		HasBypassTech:  hasBypassTech,
 	}, true
 }
 
@@ -311,12 +308,8 @@ func measureTCPPing(host, port string) (time.Duration, bool) {
 }
 
 func simulateTSPUBypassCheck(proto, port, sni string) bool {
-	validPorts := map[string]bool{
-		"80": true, "443": true, "8080": true, "8443": true, "2053": true,
-		"2083": true, "2087": true, "2096": true, "4433": true, "8000": true, "8880": true,
-	}
-
-	if (proto == "ss" || proto == "ssr") && !validPorts[port] {
+	// Блокируем голый Shadowsocks / SSR на нестандартных портах без TLS, так как ТСПУ детектирует их моментально
+	if (proto == "ss" || proto == "ssr") && port != "443" && port != "8443" && port != "80" {
 		return false
 	}
 	return true
@@ -326,12 +319,12 @@ func getFreeLocalPort() (int, error) {
 	portMutex.Lock()
 	defer portMutex.Unlock()
 
-	for i := 0; i < 200; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(25000))
+	for i := 0; i < 300; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(20000))
 		if err != nil {
 			continue
 		}
-		port := int(n.Int64()) + 20000
+		port := int(n.Int64()) + 25000
 		if usedPorts[port] {
 			continue
 		}
@@ -342,7 +335,7 @@ func getFreeLocalPort() (int, error) {
 			_ = l.Close()
 			usedPorts[port] = true
 			go func(p int) {
-				time.Sleep(3 * time.Second)
+				time.Sleep(5 * time.Second)
 				portMutex.Lock()
 				delete(usedPorts, p)
 				portMutex.Unlock()
@@ -396,8 +389,8 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 40; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
+	for i := 0; i < 50; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
@@ -421,7 +414,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   3500 * time.Millisecond,
+		Timeout:   3000 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
@@ -431,7 +424,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 3000*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
@@ -459,7 +452,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 }
 
 func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
-	host, portStr, sni, path, netType, outboundProtocol := parseConfigDetails(configURL)
+	host, portStr, sni, path, netType, outboundProtocol, security, flow := parseConfigDetails(configURL)
 	if host == "" {
 		return nil, fmt.Errorf("invalid host")
 	}
@@ -469,10 +462,10 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		port = 443
 	}
 
+	u, err := url.Parse(configURL)
 	var query url.Values
 	var uuid string
 
-	u, err := url.Parse(configURL)
 	if err == nil && u != nil {
 		query = u.Query()
 		if u.User != nil {
@@ -494,7 +487,6 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		}
 	}
 
-	security := query.Get("security")
 	if security == "" {
 		if outboundProtocol == "trojan" || outboundProtocol == "hysteria2" || outboundProtocol == "hy2" || outboundProtocol == "tuic" {
 			security = "tls"
@@ -509,25 +501,14 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	if fp == "" {
 		fp = "chrome"
 	}
-	flow := query.Get("flow")
 
 	if netType == "" {
 		netType = "tcp"
 	}
 
-	// Настройка sockopt для фрагментации пакетов (5-10, 5-15)
-	sockopt := map[string]interface{}{
-		"fragment": map[string]interface{}{
-			"packets":  "tlshello",
-			"length":   "5-10",
-			"interval": "5-15",
-		},
-	}
-
 	streamSettings := map[string]interface{}{
 		"network":  netType,
 		"security": security,
-		"sockopt":  sockopt,
 	}
 
 	if security == "reality" {
@@ -685,7 +666,7 @@ func ensureCoreAvailable() {
 		return
 	}
 
-	fmt.Println("Скачивание актуального бинарника Xray Core...")
+	fmt.Println("Загрузка Xray Core...")
 	var downloadURL string
 	switch runtime.GOOS {
 	case "linux":
@@ -903,22 +884,26 @@ func getIPCountryCode(host string) string {
 	return ""
 }
 
-func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string) int {
-	score := 100 + (passedServices * 150)
+func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string, ruSNI bool, hasBypassTech bool) int {
+	score := 100 + (passedServices * 200)
 
 	if countryCode == "RU" {
 		score += 1000
 	} else if isNearRU {
-		score += 650
+		score += 600
 	}
 
-	if isRuSNI(sni) {
+	if ruSNI {
+		score += 800
+	}
+	if hasBypassTech {
 		score += 500
 	}
+
 	if transport == "grpc" {
-		score += 120
+		score += 150
 	} else if transport == "ws" {
-		score += 80
+		score += 100
 	}
 
 	pingMs := int(latency.Milliseconds())
@@ -951,7 +936,7 @@ func setConfigName(configURL string, name string) string {
 	return configURL + "#" + escapedName
 }
 
-func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string) {
+func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string, security string, flow string) {
 	if strings.HasPrefix(configStr, "vmess://") {
 		b64 := configStr[8:]
 		if idx := strings.Index(b64, "#"); idx != -1 {
@@ -978,47 +963,15 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 				}
 				path, _ = vmap["path"].(string)
 				transport, _ = vmap["net"].(string)
-				return host, port, sni, path, strings.ToLower(transport), "vmess"
-			}
-		}
-	}
-
-	if strings.HasPrefix(configStr, "ss://") {
-		raw := configStr[5:]
-		if idx := strings.Index(raw, "#"); idx != -1 {
-			raw = raw[:idx]
-		}
-		if strings.Contains(raw, "@") {
-			parts := strings.SplitN(raw, "@", 2)
-			userInfo := parts[0]
-			hostPort := parts[1]
-			if !strings.Contains(userInfo, ":") {
-				if decoded, err := decodeBase64Flex(userInfo); err == nil {
-					userInfo = string(decoded)
-				}
-			}
-			if queryIdx := strings.Index(hostPort, "/?"); queryIdx != -1 {
-				hostPort = hostPort[:queryIdx]
-			}
-			if hpHost, hpPort, err := net.SplitHostPort(hostPort); err == nil {
-				return hpHost, hpPort, "", "/", "tcp", "ss"
-			}
-		} else {
-			if decoded, err := decodeBase64Flex(raw); err == nil {
-				decodedStr := string(decoded)
-				if strings.Contains(decodedStr, "@") {
-					parts := strings.SplitN(decodedStr, "@", 2)
-					if hpHost, hpPort, err := net.SplitHostPort(parts[1]); err == nil {
-						return hpHost, hpPort, "", "/", "tcp", "ss"
-					}
-				}
+				security, _ = vmap["tls"].(string)
+				return host, port, sni, path, strings.ToLower(transport), "vmess", security, ""
 			}
 		}
 	}
 
 	u, err := url.Parse(configStr)
 	if err != nil {
-		return "", "", "", "", "", ""
+		return "", "", "", "", "", "", "", ""
 	}
 
 	proto = strings.ToLower(u.Scheme)
@@ -1047,6 +1000,9 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		transport = strings.ToLower(query.Get("headerType"))
 	}
 
+	security = query.Get("security")
+	flow = query.Get("flow")
+
 	if port == "" {
 		switch proto {
 		case "vless", "vmess", "trojan", "hysteria2", "hy2", "tuic":
@@ -1055,7 +1011,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 			port = "8388"
 		}
 	}
-	return host, port, sni, path, transport, proto
+	return host, port, sni, path, transport, proto, security, flow
 }
 
 func readLines(path string) ([]string, error) {
