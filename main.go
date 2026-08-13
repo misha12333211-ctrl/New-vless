@@ -21,18 +21,17 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
 const (
-	maxConcurrency   = 40                      // Оптимально для runner 2 vCPU GitHub Actions
-	maxOutputLimit   = 350                     // Количество серверов в итоговой подписке
-	pingTimeout      = 2000 * time.Millisecond // Таймаут TCP
-	serviceTimeout   = 7500 * time.Millisecond // Таймаут поднятия Xray + проверки
-	minSuccessCount  = 7                       // МИНИМУМ 7 РЕАЛЬНО РАБОТАЮЩИХ СЕРВИСОВ ИЗ 8
-	portRangeStart   = 32000
-	portRangeEnd     = 45000
+	maxConcurrency  = 30                      // Безопасное значение для GitHub Actions runner
+	maxOutputLimit  = 350                     // Итоговый лимит подписки
+	pingTimeout     = 1800 * time.Millisecond // Таймаут TCP
+	serviceTimeout  = 8500 * time.Millisecond // Таймаут запуска Xray и проверки
+	minSuccessCount = 7                       // Гарантия: минимум 7 работающих сервисов из 8
+	portRangeStart  = 30000
+	portRangeEnd    = 45000
 )
 
 type ConfigResult struct {
@@ -53,7 +52,7 @@ type TargetService struct {
 	URL  string
 }
 
-// 8 популярных сервисов для проверки сквозного выхода в интернет
+// 8 целевых сервисов для проверки доступности
 var targetServices = []TargetService{
 	{Name: "Google", URL: "https://www.google.com/generate_204"},
 	{Name: "Telegram", URL: "https://t.me"},
@@ -65,7 +64,7 @@ var targetServices = []TargetService{
 	{Name: "ChatGPT", URL: "https://chatgpt.com"},
 }
 
-// Домены ТСПУ / РФ для получения бонуса в ранжировании
+// Домены РФ / ТСПУ для приоритезации
 var ruWhiteSNIs = []string{
 	"ya.ru", "yandex.ru", "yandex.com", "api-maps.yandex.ru", "avatars.mds.yandex.net",
 	"browser.yandex.ru", "dzen.ru", "kinopoisk.ru", "hd.kinopoisk.ru", "st.kinopoisk.ru",
@@ -117,20 +116,20 @@ func main() {
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
 
 	fmt.Println("=== [2/5] Сбор и декодирование прокси-конфигураций ===")
-	rawConfigs := make(chan string, 50000)
+	rawConfigs := make(chan string, 100000)
 	var wg sync.WaitGroup
 
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          500,
-		MaxIdleConnsPerHost:   50,
-		IdleConnTimeout:       15 * time.Second,
-		ResponseHeaderTimeout: 8 * time.Second,
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       10 * time.Second,
+		ResponseHeaderTimeout: 6 * time.Second,
 	}
 	defer tr.CloseIdleConnections()
 
 	sharedHTTPClient := &http.Client{
-		Timeout:   10 * time.Second,
+		Timeout:   8 * time.Second,
 		Transport: tr,
 	}
 
@@ -192,7 +191,7 @@ func main() {
 
 	var validResults []ConfigResult
 	for res := range resultsChan {
-		if res.ServiceSuccess >= minSuccessCount { // Гарантия работы минимум 7 сервисов
+		if res.ServiceSuccess >= minSuccessCount {
 			validResults = append(validResults, res)
 		}
 	}
@@ -295,7 +294,8 @@ func testConfig(configStr string) (ConfigResult, bool) {
 func measureTCPPing(host, port string) (time.Duration, bool) {
 	address := net.JoinHostPort(host, port)
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", address, pingTimeout)
+	d := net.Dialer{Timeout: pingTimeout}
+	conn, err := d.Dial("tcp", address)
 	if err != nil {
 		return 0, false
 	}
@@ -304,7 +304,7 @@ func measureTCPPing(host, port string) (time.Duration, bool) {
 }
 
 func getNextLocalPort() int {
-	for {
+	for i := 0; i < 50; i++ {
 		p := atomic.AddUint32(&portCounter, 1)
 		if p > portRangeEnd {
 			atomic.StoreUint32(&portCounter, portRangeStart)
@@ -317,6 +317,7 @@ func getNextLocalPort() int {
 			return int(p)
 		}
 	}
+	return int(portRangeStart + (time.Now().UnixNano() % 10000))
 }
 
 func checkTargetServicesViaProxy(configStr string) (int, bool) {
@@ -344,7 +345,6 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, corePath, "run", "-c", tmpConfigPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		return 0, false
@@ -352,21 +352,21 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	defer func() {
 		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 		}
 	}()
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 50; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 30*time.Millisecond)
+	for i := 0; i < 40; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -384,18 +384,17 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   3000 * time.Millisecond,
+		Timeout:   3200 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
 	var successCount int64
 
-	// Последовательный каскадный старт запросов для защиты SOCKS5 сокета от перегрузки
 	for _, service := range targetServices {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 2800*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 3000*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
@@ -415,7 +414,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 				atomic.AddInt64(&successCount, 1)
 			}
 		}(service)
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	wg.Wait()
@@ -770,7 +769,6 @@ func sanitizeProxyURL(u string) string {
 	u = strings.TrimSpace(u)
 	u = strings.ReplaceAll(u, "\r", "")
 	u = strings.ReplaceAll(u, "\n", "")
-	u = strings.ReplaceAll(u, " ", "%20")
 	return u
 }
 
@@ -892,11 +890,10 @@ func isRuSNI(sni string) bool {
 }
 
 func setConfigName(configURL string, name string) string {
-	escapedName := url.PathEscape(name)
 	if idx := strings.Index(configURL, "#"); idx != -1 {
-		return configURL[:idx] + "#" + escapedName
+		return configURL[:idx] + "#" + name
 	}
-	return configURL + "#" + escapedName
+	return configURL + "#" + name
 }
 
 func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string) {
