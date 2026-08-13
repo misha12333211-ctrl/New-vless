@@ -4,11 +4,13 @@ import (
 	"archive/zip"
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,13 +27,10 @@ import (
 )
 
 const (
-	maxConcurrency  = 30                      // Безопасное значение для GitHub Actions runner
-	maxOutputLimit  = 350                     // Итоговый лимит подписки
-	pingTimeout     = 1800 * time.Millisecond // Таймаут TCP
-	serviceTimeout  = 8500 * time.Millisecond // Таймаут запуска Xray и проверки
-	minSuccessCount = 7                       // Гарантия: минимум 7 работающих сервисов из 8
-	portRangeStart  = 30000
-	portRangeEnd    = 45000
+	maxConcurrency = 50                  // Оптимальный параллелизм для runner 2 vCPU GitHub Actions
+	maxOutputLimit = 350                 // Количество серверов в итоговой подписке
+	pingTimeout    = 2500 * time.Millisecond  // Таймаут измерений TCP
+	serviceTimeout = 8000 * time.Millisecond  // Таймаут поднятия Xray + проверки сервисов
 )
 
 type ConfigResult struct {
@@ -52,7 +51,7 @@ type TargetService struct {
 	URL  string
 }
 
-// 8 целевых сервисов для проверки доступности
+// Популярные сервисы для проверки сквозного выхода в интернет
 var targetServices = []TargetService{
 	{Name: "Google", URL: "https://www.google.com/generate_204"},
 	{Name: "Telegram", URL: "https://t.me"},
@@ -64,7 +63,7 @@ var targetServices = []TargetService{
 	{Name: "ChatGPT", URL: "https://chatgpt.com"},
 }
 
-// Домены РФ / ТСПУ для приоритезации
+// Домены "белого списка" ТСПУ и российских сервисов для гарантированного обхода
 var ruWhiteSNIs = []string{
 	"ya.ru", "yandex.ru", "yandex.com", "api-maps.yandex.ru", "avatars.mds.yandex.net",
 	"browser.yandex.ru", "dzen.ru", "kinopoisk.ru", "hd.kinopoisk.ru", "st.kinopoisk.ru",
@@ -86,6 +85,7 @@ var ruWhiteSNIs = []string{
 	"beeline.ru", "mts.ru", "megafon.ru", "tele2.ru", "yota.ru", "rt.ru", "rostelecom.ru",
 }
 
+// Страны с минимальной задержкой до РФ
 var nearRUCountries = map[string]bool{
 	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
 	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
@@ -96,19 +96,20 @@ var nearRUCountries = map[string]bool{
 var (
 	geoCacheMutex sync.RWMutex
 	geoIPCache    = make(map[string]string)
-	portCounter   uint32 = portRangeStart
+	portMutex     sync.Mutex
+	usedPorts     = make(map[int]bool)
 )
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	startTime := time.Now()
 
-	fmt.Println("=== [1/5] Инициализация окружения и Xray Core ===")
+	fmt.Println("=== [1/5] Подготовка рабочего окружения и бинарника Xray Core ===")
 	ensureCoreAvailable()
 
 	sources, err := readLines("sources.txt")
 	if err != nil {
-		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые выходы.\n", err)
+		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые файлы подписок.\n", err)
 		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
@@ -116,20 +117,20 @@ func main() {
 	fmt.Printf("Загружено источников подписок: %d\n", len(sources))
 
 	fmt.Println("=== [2/5] Сбор и декодирование прокси-конфигураций ===")
-	rawConfigs := make(chan string, 100000)
+	rawConfigs := make(chan string, 500000)
 	var wg sync.WaitGroup
 
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 		MaxIdleConns:          1000,
 		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       10 * time.Second,
-		ResponseHeaderTimeout: 6 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
 	}
 	defer tr.CloseIdleConnections()
 
 	sharedHTTPClient := &http.Client{
-		Timeout:   8 * time.Second,
+		Timeout:   12 * time.Second,
 		Transport: tr,
 	}
 
@@ -159,9 +160,9 @@ func main() {
 	}
 
 	totalConfigs := len(uniqueConfigs)
-	fmt.Printf("Собрано %d уникальных прокси-ссылок.\n", totalConfigs)
+	fmt.Printf("Успешно собрано %d уникальных прокси-ссылок.\n", totalConfigs)
 
-	fmt.Println("=== [3/5] Мульти-сервисное тестирование через Xray ===")
+	fmt.Println("=== [3/5] Строгая фильтрация под ТСПУ (ТОЛЬКО RU-SNI) и проверка работы ===")
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
@@ -179,7 +180,7 @@ func main() {
 			}
 
 			curr := atomic.AddInt64(&processedCount, 1)
-			if curr%250 == 0 || curr == int64(totalConfigs) {
+			if curr%500 == 0 || curr == int64(totalConfigs) {
 				fmt.Printf("Проверено узлов: %d / %d\r", curr, totalConfigs)
 			}
 		}(cfg)
@@ -191,21 +192,21 @@ func main() {
 
 	var validResults []ConfigResult
 	for res := range resultsChan {
-		if res.ServiceSuccess >= minSuccessCount {
+		if res.Score > 0 {
 			validResults = append(validResults, res)
 		}
 	}
 
-	fmt.Printf("=== [4/5] Ранжирование и выбор лучших (Валидных с >=%d сервисами: %d) ===\n", minSuccessCount, len(validResults))
+	fmt.Printf("=== [4/5] Сортировка серверов с RU-SNI (Валидных с RU-SNI: %d) ===\n", len(validResults))
 
 	sort.Slice(validResults, func(i, j int) bool {
-		if validResults[i].ServiceSuccess != validResults[j].ServiceSuccess {
-			return validResults[i].ServiceSuccess > validResults[j].ServiceSuccess
-		}
-		if validResults[i].Score != validResults[j].Score {
+		if validResults[i].ServiceSuccess == validResults[j].ServiceSuccess {
+			if validResults[i].Score == validResults[j].Score {
+				return validResults[i].AdjustedPing < validResults[j].AdjustedPing
+			}
 			return validResults[i].Score > validResults[j].Score
 		}
-		return validResults[i].AdjustedPing < validResults[j].AdjustedPing
+		return validResults[i].ServiceSuccess > validResults[j].ServiceSuccess
 	})
 
 	var selected []ConfigResult
@@ -223,17 +224,15 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		tag := "GLOBAL"
-		if r.IsRuSNI {
-			tag = "RU-SNI"
-		} else if r.CountryCode != "" {
-			tag = r.CountryCode
+		tag := "RU-SNI"
+		if r.CountryCode != "" {
+			tag = fmt.Sprintf("%s-RUSNI", r.CountryCode)
 		}
-		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-%s-S%d-%d | @MiGiTi_official_channel", tag, r.ServiceSuccess, i+1))
+		renamedURL := setConfigName(r.URL, fmt.Sprintf("MiGiTi-%s-%d | @MiGiTi_official_channel", tag, i+1))
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-	fmt.Printf("Сформирован итоговый список из %d стабильных серверов.\n", len(finalSlice))
+	fmt.Printf("Сформирован итоговый список из %d строго валидных RU-SNI серверов.\n", len(finalSlice))
 
 	fmt.Println("=== [5/5] Запись файлов подписки ===")
 	rawOutput := strings.Join(finalSlice, "\n")
@@ -251,17 +250,27 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
+	// СТРОГОЕ ТРЕБОВАНИЕ: ТОЛЬКО Российские SNI (Яндекс, VK, Госуслуги, Mail.ru и т.д.)
+	// Любой зарубежный SNI или отсутствие SNI отбраковываются безоговорочно.
 	ruSNI := isRuSNI(sni)
+	if !ruSNI {
+		return ConfigResult{}, false
+	}
 
-	// 1. Быстрый TCP пинг
+	// 1. Предварительная проверка портов
+	if !simulateTSPUBypassCheck(proto, port, sni) {
+		return ConfigResult{}, false
+	}
+
+	// 2. Измерение сетевого пинга до узла
 	realPing, ok := measureTCPPing(host, port)
 	if !ok || realPing > pingTimeout {
 		return ConfigResult{}, false
 	}
 
-	// 2. Проверка 8 сервисов через Xray
+	// 3. Проверка реального соединения через Xray Core
 	passedServices, ok := checkTargetServicesViaProxy(configStr)
-	if !ok || passedServices < minSuccessCount {
+	if !ok || passedServices < 1 {
 		return ConfigResult{}, false
 	}
 
@@ -270,12 +279,12 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	adjustedPing := realPing
 	if countryCode == "RU" {
-		adjustedPing = time.Duration(float64(realPing) * 0.4)
+		adjustedPing = time.Duration(float64(realPing) * 0.3)
 	} else if isNearRU {
-		adjustedPing = time.Duration(float64(realPing) * 0.7)
+		adjustedPing = time.Duration(float64(realPing) * 0.6)
 	}
 
-	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, countryCode, ruSNI)
+	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, countryCode)
 
 	return ConfigResult{
 		URL:            configStr,
@@ -287,15 +296,14 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		Protocol:       proto,
 		CountryCode:    countryCode,
 		IsNearRU:       isNearRU,
-		IsRuSNI:        ruSNI,
+		IsRuSNI:        true,
 	}, true
 }
 
 func measureTCPPing(host, port string) (time.Duration, bool) {
 	address := net.JoinHostPort(host, port)
 	start := time.Now()
-	d := net.Dialer{Timeout: pingTimeout}
-	conn, err := d.Dial("tcp", address)
+	conn, err := net.DialTimeout("tcp", address, pingTimeout)
 	if err != nil {
 		return 0, false
 	}
@@ -303,21 +311,48 @@ func measureTCPPing(host, port string) (time.Duration, bool) {
 	return time.Since(start), true
 }
 
-func getNextLocalPort() int {
-	for i := 0; i < 50; i++ {
-		p := atomic.AddUint32(&portCounter, 1)
-		if p > portRangeEnd {
-			atomic.StoreUint32(&portCounter, portRangeStart)
-			p = portRangeStart
+func simulateTSPUBypassCheck(proto, port, sni string) bool {
+	validPorts := map[string]bool{
+		"80": true, "443": true, "8080": true, "8443": true, "2053": true,
+		"2083": true, "2087": true, "2096": true, "4433": true, "8000": true, "8880": true,
+	}
+
+	// Стандартные протоколы на нестандартных портах блокируются ТСПУ
+	if (proto == "ss" || proto == "ssr") && !validPorts[port] {
+		return false
+	}
+	return true
+}
+
+func getFreeLocalPort() (int, error) {
+	portMutex.Lock()
+	defer portMutex.Unlock()
+
+	for i := 0; i < 200; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(25000))
+		if err != nil {
+			continue
 		}
-		addr := fmt.Sprintf("127.0.0.1:%d", p)
+		port := int(n.Int64()) + 20000
+		if usedPorts[port] {
+			continue
+		}
+
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
 		l, err := net.Listen("tcp", addr)
 		if err == nil {
 			_ = l.Close()
-			return int(p)
+			usedPorts[port] = true
+			go func(p int) {
+				time.Sleep(3 * time.Second)
+				portMutex.Lock()
+				delete(usedPorts, p)
+				portMutex.Unlock()
+			}(port)
+			return port, nil
 		}
 	}
-	return int(portRangeStart + (time.Now().UnixNano() % 10000))
+	return 0, fmt.Errorf("no free port available")
 }
 
 func checkTargetServicesViaProxy(configStr string) (int, bool) {
@@ -326,12 +361,17 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
-	socksPort := getNextLocalPort()
+	socksPort, err := getFreeLocalPort()
+	if err != nil {
+		return 0, false
+	}
+
 	xrayConfigJSON, err := generateXrayConfig(configStr, socksPort)
 	if err != nil {
 		return 0, false
 	}
 
+	// Запись временного файла конфигурации для надежного старта Xray
 	tmpConfigFile, err := os.CreateTemp("", "xray_cfg_*.json")
 	if err != nil {
 		return 0, false
@@ -366,7 +406,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 			proxyReady = true
 			break
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -378,13 +418,13 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		Proxy:               http.ProxyURL(proxyURL),
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: 2500 * time.Millisecond,
+		TLSHandshakeTimeout: 3 * time.Second,
 	}
 	defer httpTransport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   3200 * time.Millisecond,
+		Timeout:   3500 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
@@ -408,18 +448,17 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 				return
 			}
 			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
+			resp.Body.Close()
 
-			if resp.StatusCode >= 200 && resp.StatusCode <= 399 {
+			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
 				atomic.AddInt64(&successCount, 1)
 			}
 		}(service)
-		time.Sleep(15 * time.Millisecond)
 	}
 
 	wg.Wait()
 	totalSuccess := int(atomic.LoadInt64(&successCount))
-	return totalSuccess, totalSuccess >= minSuccessCount
+	return totalSuccess, totalSuccess > 0
 }
 
 func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
@@ -448,6 +487,14 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		}
 	} else {
 		query = make(url.Values)
+	}
+
+	if uuid == "" && strings.Contains(configURL, "@") {
+		parts := strings.SplitN(configURL, "@", 2)
+		schemeSep := strings.Index(parts[0], "://")
+		if schemeSep != -1 {
+			uuid = parts[0][schemeSep+3:]
+		}
 	}
 
 	security := query.Get("security")
@@ -631,7 +678,7 @@ func ensureCoreAvailable() {
 		return
 	}
 
-	fmt.Println("Скачивание бинарника Xray Core...")
+	fmt.Println("Скачивание актуального бинарника Xray Core...")
 	var downloadURL string
 	switch runtime.GOOS {
 	case "linux":
@@ -648,8 +695,7 @@ func ensureCoreAvailable() {
 		return
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(downloadURL)
+	resp, err := http.Get(downloadURL)
 	if err != nil {
 		return
 	}
@@ -689,12 +735,12 @@ func ensureCoreAvailable() {
 			outPath := filepath.Join(cwd, targetExe)
 			outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 			if err != nil {
-				_ = rc.Close()
+				rc.Close()
 				return
 			}
 			_, err = io.Copy(outFile, rc)
-			_ = rc.Close()
-			_ = outFile.Close()
+			rc.Close()
+			outFile.Close()
 			if err == nil {
 				_ = os.Chmod(outPath, 0755)
 				fmt.Printf("Xray Core загружен: (%s)\n", outPath)
@@ -715,16 +761,16 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
+			resp.Body.Close()
 		}
 		return
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
+		resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
 	if err != nil {
 		return
 	}
@@ -754,8 +800,8 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 5*1024*1024)
+	buf := make([]byte, 128*1024)
+	scanner.Buffer(buf, 10*1024*1024)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -769,6 +815,7 @@ func sanitizeProxyURL(u string) string {
 	u = strings.TrimSpace(u)
 	u = strings.ReplaceAll(u, "\r", "")
 	u = strings.ReplaceAll(u, "\n", "")
+	u = strings.ReplaceAll(u, " ", "%20")
 	return u
 }
 
@@ -830,7 +877,7 @@ func getIPCountryCode(host string) string {
 	}
 	geoCacheMutex.RUnlock()
 
-	client := &http.Client{Timeout: 1000 * time.Millisecond}
+	client := &http.Client{Timeout: 1200 * time.Millisecond}
 	resp, err := client.Get("http://ip-api.com/json/" + ipStr + "?fields=countryCode")
 	if err != nil {
 		return ""
@@ -849,17 +896,17 @@ func getIPCountryCode(host string) string {
 	return ""
 }
 
-func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string, isRuSNI bool) int {
-	score := 100 + (passedServices * 250)
+func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string) int {
+	score := 100 + (passedServices * 150)
 
 	if countryCode == "RU" {
 		score += 1000
 	} else if isNearRU {
-		score += 600
+		score += 650
 	}
 
-	if isRuSNI {
-		score += 450
+	if isRuSNI(sni) {
+		score += 500
 	}
 	if transport == "grpc" {
 		score += 120
@@ -890,10 +937,11 @@ func isRuSNI(sni string) bool {
 }
 
 func setConfigName(configURL string, name string) string {
+	escapedName := url.PathEscape(name)
 	if idx := strings.Index(configURL, "#"); idx != -1 {
-		return configURL[:idx] + "#" + name
+		return configURL[:idx] + "#" + escapedName
 	}
-	return configURL + "#" + name
+	return configURL + "#" + escapedName
 }
 
 func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string) {
