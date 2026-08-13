@@ -1,8 +1,10 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -27,8 +29,8 @@ import (
 )
 
 const (
-	maxConcurrency = 40                 // Оптимизировано для GitHub Actions
-	maxOutputLimit = 300                // Лимит лучших серверов в подписке
+	maxConcurrency = 50                  // Оптимизировано для GitHub Actions (2 vCPU / 7GB RAM)
+	maxOutputLimit = 300                 // Лимит лучших серверов в подписке
 	pingTimeout    = 2500 * time.Millisecond
 	serviceTimeout = 8000 * time.Millisecond
 )
@@ -93,7 +95,7 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	startTime := time.Now()
 
-	fmt.Println("=== [1/5] Подготовка среды и Xray Core ===")
+	fmt.Println("=== [1/5] Подготовка среды и sing-box Core ===")
 	ensureCoreAvailable()
 
 	sources, err := readLines("sources.txt")
@@ -111,8 +113,8 @@ func main() {
 
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          1000,
-		MaxIdleConnsPerHost:   100,
+		MaxIdleConns:          2000,
+		MaxIdleConnsPerHost:   200,
 		IdleConnTimeout:       30 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 	}
@@ -297,11 +299,9 @@ func testConfig(configStr string) (ConfigResult, bool) {
 }
 
 func passTSPUBypassFilter(proto, port, sni, security string) bool {
-	// Блокируем голый Shadowsocks/SSR на нестандартных портах без шифрования TLS/REALITY
 	if (proto == "ss" || proto == "ssr") && port != "443" && port != "8443" && port != "80" && security == "none" {
 		return false
 	}
-	// Смягченная проверка: Все прокси REALITY, Hysteria2, TUIC, VLESS-Vision пропускаются 100%
 	return true
 }
 
@@ -348,11 +348,6 @@ func getFreeLocalPort() (int, error) {
 }
 
 func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
-	// Hysteria2 и TUIC валидируются напрямую через сокетный TLS/UDP тест, если Xray-core их не поддерживает
-	if proto == "hysteria2" || proto == "hy2" || proto == "tuic" {
-		return validateQUICProtocol(configStr)
-	}
-
 	corePath := findCoreExecutable()
 	if corePath == "" {
 		return 0, false
@@ -363,17 +358,17 @@ func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
 		return 0, false
 	}
 
-	xrayConfigJSON, err := generateXrayConfig(configStr, socksPort)
+	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
 	if err != nil {
 		return 0, false
 	}
 
-	tmpConfigFile, err := os.CreateTemp("", "xray_cfg_*.json")
+	tmpConfigFile, err := os.CreateTemp("", "sb_cfg_*.json")
 	if err != nil {
 		return 0, false
 	}
 	tmpConfigPath := tmpConfigFile.Name()
-	_, _ = tmpConfigFile.Write(xrayConfigJSON)
+	_, _ = tmpConfigFile.Write(singBoxConfigJSON)
 	_ = tmpConfigFile.Close()
 	defer os.Remove(tmpConfigPath)
 
@@ -395,14 +390,14 @@ func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 60; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
+	for i := 0; i < 80; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 15*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -457,35 +452,7 @@ func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
 	return totalSuccess, totalSuccess > 0
 }
 
-func validateQUICProtocol(configURL string) (int, bool) {
-	host, portStr, sni, _, _, _, _, _ := parseConfigDetails(configURL)
-	if host == "" {
-		return 0, false
-	}
-	if sni == "" {
-		sni = host
-	}
-	port, _ := strconv.Atoi(portStr)
-	if port == 0 {
-		port = 443
-	}
-
-	// Валидируем доступность UDP/QUIC порта и TLS хэндшейка
-	dialer := &net.Dialer{Timeout: 2000 * time.Millisecond}
-	conn, err := tls.DialWithDialer(dialer, "tcp", fmt.Sprintf("%s:%d", host, port), &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         sni,
-	})
-	if err != nil {
-		return 0, false
-	}
-	_ = conn.Close()
-
-	// Возвращаем 7 успешно пройденных сервисов для качественных Hysteria2/TUIC серверов
-	return 7, true
-}
-
-func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
+func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 	host, portStr, sni, path, netType, outboundProtocol, security, flow := parseConfigDetails(configURL)
 	if host == "" {
 		return nil, fmt.Errorf("invalid host")
@@ -522,7 +489,7 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 	}
 
 	if security == "" {
-		if outboundProtocol == "trojan" {
+		if outboundProtocol == "trojan" || outboundProtocol == "hysteria2" || outboundProtocol == "hy2" || outboundProtocol == "tuic" {
 			security = "tls"
 		} else {
 			security = "none"
@@ -536,35 +503,39 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		fp = "chrome"
 	}
 
-	if netType == "" {
-		netType = "tcp"
+	outbound := map[string]interface{}{
+		"server":      host,
+		"server_port": port,
+		"tag":         "proxy",
 	}
 
-	streamSettings := map[string]interface{}{
-		"network":  netType,
-		"security": security,
+	// Настройка TLS / REALITY для sing-box
+	tlsConfig := map[string]interface{}{
+		"enabled":     security == "tls" || security == "reality",
+		"server_name": sni,
+		"insecure":    true,
+	}
+
+	if fp != "" {
+		tlsConfig["utls"] = map[string]interface{}{
+			"enabled":     true,
+			"fingerprint": fp,
+		}
 	}
 
 	if security == "reality" {
-		streamSettings["realitySettings"] = map[string]interface{}{
-			"serverName":  sni,
-			"fingerprint": fp,
-			"publicKey":   pbk,
-			"shortId":     sid,
-			"spiderX":      "/",
+		tlsConfig["reality"] = map[string]interface{}{
+			"enabled":    true,
+			"public_key": pbk,
+			"short_id":   sid,
 		}
-	} else if security == "tls" {
-		tlsSettings := map[string]interface{}{
-			"serverName":    sni,
-			"fingerprint":   fp,
-			"allowInsecure": true,
-		}
-		if alpn := query.Get("alpn"); alpn != "" {
-			tlsSettings["alpn"] = strings.Split(alpn, ",")
-		}
-		streamSettings["tlsSettings"] = tlsSettings
+	}
+	if alpn := query.Get("alpn"); alpn != "" {
+		tlsConfig["alpn"] = strings.Split(alpn, ",")
 	}
 
+	// Настройка Транспорта (WS / gRPC)
+	var transportConfig map[string]interface{}
 	if netType == "ws" {
 		headers := map[string]interface{}{}
 		if sni != "" {
@@ -572,7 +543,8 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		} else if query.Get("host") != "" {
 			headers["Host"] = query.Get("host")
 		}
-		streamSettings["wsSettings"] = map[string]interface{}{
+		transportConfig = map[string]interface{}{
+			"type":    "ws",
 			"path":    path,
 			"headers": headers,
 		}
@@ -581,35 +553,43 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		if serviceName == "" {
 			serviceName = query.Get("path")
 		}
-		streamSettings["grpcSettings"] = map[string]interface{}{
-			"serviceName": serviceName,
-			"multiMode":   query.Get("mode") == "multi",
+		transportConfig = map[string]interface{}{
+			"type":         "grpc",
+			"service_name": serviceName,
 		}
 	}
 
-	var outboundSettings map[string]interface{}
-
 	switch outboundProtocol {
-	case "trojan":
-		outboundSettings = map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{"address": host, "port": port, "password": uuid},
-			},
+	case "vless":
+		outbound["type"] = "vless"
+		outbound["uuid"] = uuid
+		if flow != "" {
+			outbound["flow"] = flow
 		}
+		outbound["tls"] = tlsConfig
+		if transportConfig != nil {
+			outbound["transport"] = transportConfig
+		}
+
 	case "vmess":
-		outboundSettings = map[string]interface{}{
-			"vnext": []map[string]interface{}{
-				{
-					"address": host,
-					"port":    port,
-					"users": []map[string]interface{}{
-						{"id": uuid, "alterId": 0, "security": "auto"},
-					},
-				},
-			},
+		outbound["type"] = "vmess"
+		outbound["uuid"] = uuid
+		outbound["security"] = "auto"
+		outbound["tls"] = tlsConfig
+		if transportConfig != nil {
+			outbound["transport"] = transportConfig
 		}
+
+	case "trojan":
+		outbound["type"] = "trojan"
+		outbound["password"] = uuid
+		outbound["tls"] = tlsConfig
+		if transportConfig != nil {
+			outbound["transport"] = transportConfig
+		}
+
 	case "shadowsocks", "ss":
-		outboundProtocol = "shadowsocks"
+		outbound["type"] = "shadowsocks"
 		method := "aes-256-gcm"
 		password := uuid
 		if strings.Contains(uuid, ":") {
@@ -617,66 +597,61 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 			method = parts[0]
 			password = parts[1]
 		}
-		outboundSettings = map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{"address": host, "port": port, "method": method, "password": password},
-			},
+		outbound["method"] = method
+		outbound["password"] = password
+
+	case "hysteria2", "hy2":
+		outbound["type"] = "hysteria2"
+		outbound["password"] = uuid
+		outbound["tls"] = tlsConfig
+
+	case "tuic":
+		outbound["type"] = "tuic"
+		outbound["uuid"] = uuid
+		if pass := query.Get("password"); pass != "" {
+			outbound["password"] = pass
 		}
+		outbound["tls"] = tlsConfig
+
 	default:
-		outboundProtocol = "vless"
-		userSettings := map[string]interface{}{
-			"id":         uuid,
-			"encryption": "none",
-		}
-		if flow != "" {
-			userSettings["flow"] = flow
-		}
-		outboundSettings = map[string]interface{}{
-			"vnext": []map[string]interface{}{
-				{
-					"address": host,
-					"port":    port,
-					"users":   []map[string]interface{}{userSettings},
-				},
-			},
-		}
+		outbound["type"] = "vless"
+		outbound["uuid"] = uuid
+		outbound["tls"] = tlsConfig
 	}
 
 	config := map[string]interface{}{
-		"log": map[string]interface{}{"loglevel": "none"},
+		"log": map[string]interface{}{"level": "panic"},
 		"inbounds": []map[string]interface{}{
 			{
-				"listen":   "127.0.0.1",
-				"port":     socksPort,
-				"protocol": "socks",
-				"settings": map[string]interface{}{"auth": "noauth", "udp": true},
+				"type": listenSocksType(),
+				"tag":  "socks-in",
+				"listen": "127.0.0.1",
+				"listen_port": socksPort,
 			},
 		},
-		"outbounds": []map[string]interface{}{
-			{
-				"protocol":       outboundProtocol,
-				"settings":       outboundSettings,
-				"streamSettings": streamSettings,
-			},
-		},
+		"outbounds": []map[string]interface{}{outbound},
 	}
 
 	return json.Marshal(config)
 }
 
+func listenSocksType() string {
+	return "socks"
+}
+
 func findCoreExecutable() string {
-	if path, err := exec.LookPath("xray"); err == nil {
+	if path, err := exec.LookPath("sing-box"); err == nil {
 		return path
 	}
 	cwd, err := os.Getwd()
 	if err == nil {
-		xrayExe := "xray"
+		exe := "sing-box"
 		if runtime.GOOS == "windows" {
-			xrayExe = "xray.exe"
+			exe = "sing-box.exe"
 		}
-		xrayLocal := filepath.Join(cwd, xrayExe)
-		if _, err := os.Stat(xrayLocal); err == nil {
-			return xrayLocal
+		local := filepath.Join(cwd, exe)
+		if _, err := os.Stat(local); err == nil {
+			return local
 		}
 	}
 	return ""
@@ -687,17 +662,20 @@ func ensureCoreAvailable() {
 		return
 	}
 
-	fmt.Println("Загрузка Xray Core...")
+	fmt.Println("Загрузка sing-box Core...")
 	var downloadURL string
+	// Скачиваем актуальную стабильную версию sing-box
+	version := "1.8.11"
+	
 	switch runtime.GOOS {
 	case "linux":
 		if runtime.GOARCH == "amd64" {
-			downloadURL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+			downloadURL = fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz", version, version)
 		} else if runtime.GOARCH == "arm64" {
-			downloadURL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip"
+			downloadURL = fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-arm64.tar.gz", version, version)
 		}
 	case "windows":
-		downloadURL = "https://github.com/XTLS/Xray-windows-64.zip"
+		downloadURL = fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-windows-amd64.zip", version, version)
 	}
 
 	if downloadURL == "" {
@@ -710,51 +688,83 @@ func ensureCoreAvailable() {
 	}
 	defer resp.Body.Close()
 
-	tmpZip, err := os.CreateTemp("", "xray_download_*.zip")
-	if err != nil {
-		return
-	}
-	tmpZipName := tmpZip.Name()
-	defer os.Remove(tmpZipName)
-
-	_, err = io.Copy(tmpZip, resp.Body)
-	_ = tmpZip.Close()
-	if err != nil {
-		return
-	}
-
-	r, err := zip.OpenReader(tmpZipName)
-	if err != nil {
-		return
-	}
-	defer r.Close()
-
 	cwd, _ := os.Getwd()
-	targetExe := "xray"
+	targetExe := "sing-box"
 	if runtime.GOOS == "windows" {
-		targetExe = "xray.exe"
+		targetExe = "sing-box.exe"
 	}
 
-	for _, f := range r.File {
-		if filepath.Base(f.Name) == targetExe {
-			rc, err := f.Open()
-			if err != nil {
-				return
-			}
-			outPath := filepath.Join(cwd, targetExe)
-			outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
-			if err != nil {
+	if strings.HasSuffix(downloadURL, ".zip") {
+		tmpZip, err := os.CreateTemp("", "sb_download_*.zip")
+		if err != nil {
+			return
+		}
+		defer os.Remove(tmpZip.Name())
+
+		_, err = io.Copy(tmpZip, resp.Body)
+		_ = tmpZip.Close()
+		if err != nil {
+			return
+		}
+
+		r, err := zip.OpenReader(tmpZip.Name())
+		if err != nil {
+			return
+		}
+		defer r.Close()
+
+		for _, f := range r.File {
+			if filepath.Base(f.Name) == targetExe {
+				rc, err := f.Open()
+				if err != nil {
+					return
+				}
+				outPath := filepath.Join(cwd, targetExe)
+				outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+				if err != nil {
+					rc.Close()
+					return
+				}
+				_, err = io.Copy(outFile, rc)
 				rc.Close()
+				outFile.Close()
+				if err == nil {
+					_ = os.Chmod(outPath, 0755)
+					fmt.Printf("sing-box Core успешно загружен: (%s)\n", outPath)
+				}
+				break
+			}
+		}
+	} else if strings.HasSuffix(downloadURL, ".tar.gz") {
+		gzr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return
+		}
+		defer gzr.Close()
+
+		tr := tar.NewReader(gzr)
+		for {
+			header, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
 				return
 			}
-			_, err = io.Copy(outFile, rc)
-			rc.Close()
-			outFile.Close()
-			if err == nil {
-				_ = os.Chmod(outPath, 0755)
-				fmt.Printf("Xray Core успешно загружен: (%s)\n", outPath)
+			if filepath.Base(header.Name) == targetExe {
+				outPath := filepath.Join(cwd, targetExe)
+				outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+				if err != nil {
+					return
+				}
+				_, err = io.Copy(outFile, tr)
+				outFile.Close()
+				if err == nil {
+					_ = os.Chmod(outPath, 0755)
+					fmt.Printf("sing-box Core успешно загружен: (%s)\n", outPath)
+				}
+				break
 			}
-			break
 		}
 	}
 }
@@ -950,7 +960,6 @@ func isRuSNI(sni string) bool {
 }
 
 func setConfigName(configURL string, name string) string {
-	// Совместимый формат имени для всех клиентов (v2rayNG, Nekobox, Husi и т.д.)
 	escapedName := url.PathEscape(name)
 	if idx := strings.Index(configURL, "#"); idx != -1 {
 		return configURL[:idx] + "#" + escapedName
