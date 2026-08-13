@@ -29,10 +29,10 @@ import (
 )
 
 const (
-	maxConcurrency = 50                  // Оптимизировано для GitHub Actions (2 vCPU / 7GB RAM)
-	maxOutputLimit = 300                 // Лимит лучших серверов в подписке
-	pingTimeout    = 2500 * time.Millisecond
-	serviceTimeout = 8000 * time.Millisecond
+	maxConcurrency = 40                  // Оптимально для GitHub Actions (2 vCPU)
+	maxOutputLimit = 300                 // Лимит лучших серверов
+	pingTimeout    = 2000 * time.Millisecond
+	serviceTimeout = 9000 * time.Millisecond
 )
 
 type ConfigResult struct {
@@ -50,22 +50,22 @@ type ConfigResult struct {
 }
 
 type TargetService struct {
-	Name string
-	URL  string
+	Name           string
+	URL            string
+	ExpectedStatus func(code int) bool
 }
 
-// 7 Ключевых сервисов для жесткой проверки доступности
+// 7 Ключевых сервисов со строгой проверкой HTTP-статусов
 var targetServices = []TargetService{
-	{Name: "Google", URL: "https://www.google.com/generate_204"},
-	{Name: "Telegram", URL: "https://t.me"},
-	{Name: "GitHub", URL: "https://github.com"},
-	{Name: "YouTube", URL: "https://www.youtube.com"},
-	{Name: "Instagram", URL: "https://www.instagram.com"},
-	{Name: "WhatsApp", URL: "https://web.whatsapp.com"},
-	{Name: "ChatGPT", URL: "https://chatgpt.com"},
+	{Name: "Google", URL: "https://www.google.com/generate_204", ExpectedStatus: func(c int) bool { return c == 204 || c == 200 }},
+	{Name: "Telegram", URL: "https://t.me", ExpectedStatus: func(c int) bool { return c == 200 }},
+	{Name: "GitHub", URL: "https://github.com", ExpectedStatus: func(c int) bool { return c == 200 }},
+	{Name: "YouTube", URL: "https://www.youtube.com", ExpectedStatus: func(c int) bool { return c == 200 }},
+	{Name: "Instagram", URL: "https://www.instagram.com", ExpectedStatus: func(c int) bool { return c == 200 || c == 301 || c == 302 }},
+	{Name: "WhatsApp", URL: "https://web.whatsapp.com", ExpectedStatus: func(c int) bool { return c == 200 }},
+	{Name: "ChatGPT", URL: "https://chatgpt.com", ExpectedStatus: func(c int) bool { return c == 200 || c == 307 }},
 }
 
-// Домены из Белого Списка ТСПУ для обхода фильтрации по SNI
 var ruWhiteSNIs = []string{
 	"ya.ru", "yandex.ru", "yandex.com", "api-maps.yandex.ru", "avatars.mds.yandex.net",
 	"browser.yandex.ru", "dzen.ru", "kinopoisk.ru", "hd.kinopoisk.ru", "st.kinopoisk.ru",
@@ -76,7 +76,6 @@ var ruWhiteSNIs = []string{
 	"2gis.ru", "rutube.ru", "rambler.ru", "rbc.ru", "mts.ru", "megafon.ru", "beeline.ru",
 }
 
-// Страны с низким RTT и устойчивыми каналами к РФ
 var nearRUCountries = map[string]bool{
 	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
 	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
@@ -100,28 +99,28 @@ func main() {
 
 	sources, err := readLines("sources.txt")
 	if err != nil {
-		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые выходные файлы.\n", err)
+		fmt.Printf("Ошибка чтения sources.txt: %v. Создаем пустые файлы.\n", err)
 		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
 	fmt.Printf("Загружено источников: %d\n", len(sources))
 
-	fmt.Println("=== [2/5] Сбор, декодирование и уникализация конфигураций ===")
+	fmt.Println("=== [2/5] Сбор и декодирование конфигураций ===")
 	rawConfigs := make(chan string, 500000)
 	var wg sync.WaitGroup
 
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          2000,
-		MaxIdleConnsPerHost:   200,
-		IdleConnTimeout:       30 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       15 * time.Second,
+		ResponseHeaderTimeout: 8 * time.Second,
 	}
 	defer tr.CloseIdleConnections()
 
 	sharedHTTPClient := &http.Client{
-		Timeout:   12 * time.Second,
+		Timeout:   10 * time.Second,
 		Transport: tr,
 	}
 
@@ -151,9 +150,9 @@ func main() {
 	}
 
 	totalConfigs := len(uniqueConfigs)
-	fmt.Printf("Собрано уникальных прокси-ссылок всех протоколов: %d\n", totalConfigs)
+	fmt.Printf("Собрано уникальных прокси-ссылок: %d\n", totalConfigs)
 
-	fmt.Println("=== [3/5] Жесткое тестирование: Эмуляция ТСПУ + Проверка 7 Сервисов ===")
+	fmt.Println("=== [3/5] Жесткое тестирование: Фильтрация ТСПУ + 7 Сервисов ===")
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
@@ -188,9 +187,8 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Ранжирование и отбор серверов для РФ (Валидных: %d) ===\n", len(validResults))
+	fmt.Printf("=== [4/5] Ранжирование и выбор подписки (Валидных: %d) ===\n", len(validResults))
 
-	// Приоритет: Количество рабочих сервисов -> Скор обхода ТСПУ -> Мин. скорректированная задержка
 	sort.Slice(validResults, func(i, j int) bool {
 		if validResults[i].ServiceSuccess == validResults[j].ServiceSuccess {
 			if validResults[i].Score == validResults[j].Score {
@@ -227,7 +225,6 @@ func main() {
 			tag = fmt.Sprintf("%s-%s", r.CountryCode, tag)
 		}
 
-		// Формируем стандартизированное имя, совместимое со ВСЕМИ клиентами
 		displayName := fmt.Sprintf("MiGiTi | %s | #%d", tag, i+1)
 		renamedURL := setConfigName(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
@@ -235,7 +232,7 @@ func main() {
 
 	fmt.Printf("Сформирована итоговая подписка: %d серверов.\n", len(finalSlice))
 
-	fmt.Println("=== [5/5] Сохранение подписок в файлы ===")
+	fmt.Println("=== [5/5] Сохранение результатов ===")
 	rawOutput := strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
@@ -252,20 +249,20 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	ruSNI := isRuSNI(sni)
-	hasBypassTech := security == "reality" || proto == "hysteria2" || proto == "hy2" || proto == "tuic" || flow != ""
+	hasBypassTech := security == "reality" || proto == "hysteria2" || proto == "hy2" || proto == "tuic" || flow != "" || strings.Contains(configStr, "fp=")
 
-	// 1. Смягченная эмуляция проверки обхода ТСПУ / Блокировок
-	if !passTSPUBypassFilter(proto, port, sni, security) {
+	// 1. Фильтр ТСПУ (Отсекаем голый / незащищенный прокси, заблокированный в РФ)
+	if !passTSPUBypassFilter(proto, port, sni, security, configStr) {
 		return ConfigResult{}, false
 	}
 
-	// 2. Измерение сетевой задержки (TCP Handshake)
+	// 2. TCP Ping
 	realPing, ok := measureTCPPing(host, port)
 	if !ok || realPing > pingTimeout {
 		return ConfigResult{}, false
 	}
 
-	// 3. Проверка реальной работы всех 7 сервисов
+	// 3. Проверка реального подключения к 7 сервисам через sing-box
 	passedServices, ok := checkTargetServicesViaProxy(configStr, proto)
 	if !ok || passedServices < 1 {
 		return ConfigResult{}, false
@@ -298,8 +295,12 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}, true
 }
 
-func passTSPUBypassFilter(proto, port, sni, security string) bool {
-	if (proto == "ss" || proto == "ssr") && port != "443" && port != "8443" && port != "80" && security == "none" {
+func passTSPUBypassFilter(proto, port, sni, security, fullURL string) bool {
+	// В РФ сырой Shadowsocks, VMess/VLESS без TLS/uTLS/REALITY блокируются ТСПУ по сигнатурам.
+	if (proto == "ss" || proto == "ssr") && security == "none" && !strings.Contains(fullURL, "plugin=") {
+		return false
+	}
+	if (proto == "vless" || proto == "vmess") && security == "none" {
 		return false
 	}
 	return true
@@ -320,12 +321,12 @@ func getFreeLocalPort() (int, error) {
 	portMutex.Lock()
 	defer portMutex.Unlock()
 
-	for i := 0; i < 300; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(20000))
+	for i := 0; i < 200; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(25000))
 		if err != nil {
 			continue
 		}
-		port := int(n.Int64()) + 25000
+		port := int(n.Int64()) + 20000
 		if usedPorts[port] {
 			continue
 		}
@@ -336,7 +337,7 @@ func getFreeLocalPort() (int, error) {
 			_ = l.Close()
 			usedPorts[port] = true
 			go func(p int) {
-				time.Sleep(6 * time.Second)
+				time.Sleep(2 * time.Second)
 				portMutex.Lock()
 				delete(usedPorts, p)
 				portMutex.Unlock()
@@ -344,7 +345,7 @@ func getFreeLocalPort() (int, error) {
 			return port, nil
 		}
 	}
-	return 0, fmt.Errorf("no free port available")
+	return 0, fmt.Errorf("no free port")
 }
 
 func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
@@ -390,14 +391,14 @@ func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 80; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 15*time.Millisecond)
+	for i := 0; i < 40; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -409,13 +410,13 @@ func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
 		Proxy:               http.ProxyURL(proxyURL),
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: 4 * time.Second,
+		TLSHandshakeTimeout: 3 * time.Second,
 	}
 	defer httpTransport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   3500 * time.Millisecond,
+		Timeout:   3000 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
@@ -425,14 +426,14 @@ func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 3000*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
 			if err != nil {
 				return
 			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 			resp, err := client.Do(req)
 			if err != nil {
@@ -441,7 +442,7 @@ func checkTargetServicesViaProxy(configStr, proto string) (int, bool) {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 
-			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			if s.ExpectedStatus(resp.StatusCode) {
 				atomic.AddInt64(&successCount, 1)
 			}
 		}(service)
@@ -480,14 +481,6 @@ func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 		query = make(url.Values)
 	}
 
-	if uuid == "" && strings.Contains(configURL, "@") {
-		parts := strings.SplitN(configURL, "@", 2)
-		schemeSep := strings.Index(parts[0], "://")
-		if schemeSep != -1 {
-			uuid = parts[0][schemeSep+3:]
-		}
-	}
-
 	if security == "" {
 		if outboundProtocol == "trojan" || outboundProtocol == "hysteria2" || outboundProtocol == "hy2" || outboundProtocol == "tuic" {
 			security = "tls"
@@ -509,7 +502,6 @@ func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 		"tag":         "proxy",
 	}
 
-	// Настройка TLS / REALITY для sing-box
 	tlsConfig := map[string]interface{}{
 		"enabled":     security == "tls" || security == "reality",
 		"server_name": sni,
@@ -530,18 +522,12 @@ func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 			"short_id":   sid,
 		}
 	}
-	if alpn := query.Get("alpn"); alpn != "" {
-		tlsConfig["alpn"] = strings.Split(alpn, ",")
-	}
 
-	// Настройка Транспорта (WS / gRPC)
 	var transportConfig map[string]interface{}
 	if netType == "ws" {
 		headers := map[string]interface{}{}
 		if sni != "" {
 			headers["Host"] = sni
-		} else if query.Get("host") != "" {
-			headers["Host"] = query.Get("host")
 		}
 		transportConfig = map[string]interface{}{
 			"type":    "ws",
@@ -623,9 +609,9 @@ func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 		"log": map[string]interface{}{"level": "panic"},
 		"inbounds": []map[string]interface{}{
 			{
-				"type": listenSocksType(),
-				"tag":  "socks-in",
-				"listen": "127.0.0.1",
+				"type":        "socks",
+				"tag":         "socks-in",
+				"listen":      "127.0.0.1",
 				"listen_port": socksPort,
 			},
 		},
@@ -633,10 +619,6 @@ func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 	}
 
 	return json.Marshal(config)
-}
-
-func listenSocksType() string {
-	return "socks"
 }
 
 func findCoreExecutable() string {
@@ -664,9 +646,8 @@ func ensureCoreAvailable() {
 
 	fmt.Println("Загрузка sing-box Core...")
 	var downloadURL string
-	// Скачиваем актуальную стабильную версию sing-box
 	version := "1.8.11"
-	
+
 	switch runtime.GOOS {
 	case "linux":
 		if runtime.GOARCH == "amd64" {
@@ -683,7 +664,10 @@ func ensureCoreAvailable() {
 	}
 
 	resp, err := http.Get(downloadURL)
-	if err != nil {
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -896,8 +880,8 @@ func getIPCountryCode(host string) string {
 	}
 	geoCacheMutex.RUnlock()
 
-	client := &http.Client{Timeout: 1200 * time.Millisecond}
-	resp, err := client.Get("http://ip-api.com/json/" + ipStr + "?fields=countryCode")
+	client := &http.Client{Timeout: 1000 * time.Millisecond}
+	resp, err := client.Get("https://freeipapi.com/api/json/" + ipStr)
 	if err != nil {
 		return ""
 	}
@@ -916,25 +900,25 @@ func getIPCountryCode(host string) string {
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string, ruSNI bool, hasBypassTech bool) int {
-	score := 100 + (passedServices * 250)
+	score := 100 + (passedServices * 300)
 
 	if countryCode == "RU" {
-		score += 1200
+		score += 1500
 	} else if isNearRU {
-		score += 700
+		score += 800
 	}
 
 	if ruSNI {
-		score += 900
+		score += 1000
 	}
 	if hasBypassTech {
-		score += 600
+		score += 700
 	}
 
 	if transport == "grpc" {
-		score += 150
+		score += 200
 	} else if transport == "ws" {
-		score += 100
+		score += 150
 	}
 
 	pingMs := int(latency.Milliseconds())
@@ -960,7 +944,7 @@ func isRuSNI(sni string) bool {
 }
 
 func setConfigName(configURL string, name string) string {
-	escapedName := url.PathEscape(name)
+	escapedName := url.QueryEscape(name)
 	if idx := strings.Index(configURL, "#"); idx != -1 {
 		return configURL[:idx] + "#" + escapedName
 	}
