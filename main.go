@@ -27,10 +27,10 @@ import (
 )
 
 const (
-	maxConcurrency = 50                  // Оптимальный параллелизм для runner 2 vCPU GitHub Actions
-	maxOutputLimit = 350                 // Количество серверов в итоговой подписке
-	pingTimeout    = 2500 * time.Millisecond  // Таймаут измерений TCP
-	serviceTimeout = 8000 * time.Millisecond  // Таймаут поднятия Xray + проверки сервисов
+	maxConcurrency = 50                 // Оптимальный параллелизм для runner 2 vCPU GitHub Actions
+	maxOutputLimit = 350                // Количество серверов в итоговой подписке
+	pingTimeout    = 2500 * time.Millisecond // Таймаут измерений TCP
+	serviceTimeout = 8000 * time.Millisecond // Таймаут поднятия Xray + проверки сервисов
 )
 
 type ConfigResult struct {
@@ -251,7 +251,6 @@ func testConfig(configStr string) (ConfigResult, bool) {
 	}
 
 	// СТРОГОЕ ТРЕБОВАНИЕ: ТОЛЬКО Российские SNI (Яндекс, VK, Госуслуги, Mail.ru и т.д.)
-	// Любой зарубежный SNI или отсутствие SNI отбраковываются безоговорочно.
 	ruSNI := isRuSNI(sni)
 	if !ruSNI {
 		return ConfigResult{}, false
@@ -268,7 +267,7 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	// 3. Проверка реального соединения через Xray Core
+	// 3. Проверка реального соединения через Xray Core с фрагментацией
 	passedServices, ok := checkTargetServicesViaProxy(configStr)
 	if !ok || passedServices < 1 {
 		return ConfigResult{}, false
@@ -317,7 +316,6 @@ func simulateTSPUBypassCheck(proto, port, sni string) bool {
 		"2083": true, "2087": true, "2096": true, "4433": true, "8000": true, "8880": true,
 	}
 
-	// Стандартные протоколы на нестандартных портах блокируются ТСПУ
 	if (proto == "ss" || proto == "ssr") && !validPorts[port] {
 		return false
 	}
@@ -371,7 +369,6 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
-	// Запись временного файла конфигурации для надежного старта Xray
 	tmpConfigFile, err := os.CreateTemp("", "xray_cfg_*.json")
 	if err != nil {
 		return 0, false
@@ -518,9 +515,19 @@ func generateXrayConfig(configURL string, socksPort int) ([]byte, error) {
 		netType = "tcp"
 	}
 
+	// Настройка sockopt для фрагментации пакетов (5-10, 5-15)
+	sockopt := map[string]interface{}{
+		"fragment": map[string]interface{}{
+			"packets":  "tlshello",
+			"length":   "5-10",
+			"interval": "5-15",
+		},
+	}
+
 	streamSettings := map[string]interface{}{
 		"network":  netType,
 		"security": security,
+		"sockopt":  sockopt,
 	}
 
 	if security == "reality" {
