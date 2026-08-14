@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
