@@ -27,13 +27,12 @@ import (
 )
 
 const (
-	maxConcurrency     = 64               // Параллельное тестирование для высокой скорости
+	maxConcurrency     = 64               // Увеличено параллельное тестирование для высокой скорости
 	maxOutputLimit     = 300              // Максимальное кол-во конфигов в итоговой подписке
 	pingTimeout        = 1000 * time.Millisecond
 	serviceTimeout     = 4500 * time.Millisecond
 	fetchConcurrency   = 20
 	maxGeoCacheEntries = 20000
-	subTitle           = "MiGiTi Go Engine Whitelist"
 )
 
 type ConfigResult struct {
@@ -117,7 +116,7 @@ var (
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 1500 * time.Millisecond}
-			return d.DialContext(ctx, "udp", "77.88.8.8:53")
+			return d.DialContext(ctx, "udp", "77.88.8.8:53") // Использование быстрых DNS Яндекса
 		},
 	}
 )
@@ -256,10 +255,6 @@ func main() {
 	}
 
 	var finalSlice []string
-	
-	// Заголовок формата SIP002 / REMARKS для поддержки клиентов Karing / Husi / Exclave
-	finalSlice = append(finalSlice, fmt.Sprintf("REMARKS=%s", subTitle))
-
 	for i, r := range selected {
 		tag := strings.ToUpper(r.Protocol)
 		if r.IsRuSNI {
@@ -272,12 +267,12 @@ func main() {
 			tag = fmt.Sprintf("%s-%s", r.CountryCode, tag)
 		}
 
-		displayName := fmt.Sprintf("%s | %s | #%d", subTitle, tag, i+1)
+		displayName := fmt.Sprintf("MiGiTi New Sub Beta | @MiGiTi_official_channel | %s | #%d", tag, i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", len(finalSlice)-1)
+	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", len(finalSlice))
 
 	fmt.Println("=== [5/5] Запись результативных файлов ===")
 	rawOutput := strings.Join(finalSlice, "\n")
@@ -302,11 +297,13 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
+	// Быстрая предварительная проверка TCP сокета (Pre-flight check)
 	realPing, ok := measureTCPPing(host, port)
 	if !ok || realPing > pingTimeout {
 		return ConfigResult{}, false
 	}
 
+	// Полная функциональная проверка через локальный sing-box
 	passedServices, ok := checkTargetServicesViaProxy(configStr)
 	if !ok || passedServices < 1 {
 		return ConfigResult{}, false
@@ -340,12 +337,14 @@ func testConfig(configStr string) (ConfigResult, bool) {
 }
 
 func passTSPUBypassFilter(proto, port, sni, security, fullURL string) bool {
+	// Отсечение незащищенного Shadowsocks и VMess/VLESS без шифрования
 	if (proto == "ss" || proto == "ssr") && security == "none" && !strings.Contains(fullURL, "plugin=") {
 		return false
 	}
 	if (proto == "vless" || proto == "vmess") && (security == "none" || security == "") {
 		return false
 	}
+	// Для VLESS/VMess/Trojan обязателен TLS или REALITY
 	if proto == "vless" || proto == "vmess" || proto == "trojan" {
 		if security != "reality" && security != "tls" {
 			return false
@@ -371,12 +370,13 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
+	// Динамический выбор порта через системный Listener с безопасным перехватом
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, false
 	}
 	socksPort := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
+	_ = l.Close() // Высвобождаем порт прямо перед запуском процесса
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
 	if err != nil {
