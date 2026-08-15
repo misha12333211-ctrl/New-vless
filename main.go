@@ -267,7 +267,7 @@ func main() {
 			tag = fmt.Sprintf("%s-%s", r.CountryCode, tag)
 		}
 
-		displayName := fmt.Sprintf("MiGiTi New Sub Beta | @MiGiTi_official_channel | %s | #%d", tag, i+1)
+		displayName := fmt.Sprintf("MiGiTi Go Engine — Beta Test (WL). | Channel: https://t.me/MiGiTi_official_channel | %s | #%d", tag, i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
@@ -993,6 +993,8 @@ func isRuSNI(sni string) bool {
 }
 
 func setConfigNameUniversal(configURL string, name string) string {
+	escapedName := url.QueryEscape(name)
+
 	if strings.HasPrefix(configURL, "vmess://") && len(configURL) > 8 {
 		b64 := configURL[8:]
 		if idx := strings.Index(b64, "#"); idx != -1 {
@@ -1011,9 +1013,9 @@ func setConfigNameUniversal(configURL string, name string) string {
 	}
 
 	if idx := strings.Index(configURL, "#"); idx != -1 {
-		return configURL[:idx] + "#" + name
+		return configURL[:idx] + "#" + escapedName
 	}
-	return configURL + "#" + name
+	return configURL + "#" + escapedName
 }
 
 func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string, security string, flow string) {
