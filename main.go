@@ -274,7 +274,7 @@ func main() {
 	// Для Base64 подписки кодируем только список конфигов, без символов комментария в начале
 	b64Output := base64.StdEncoding.EncodeToString([]byte(strings.Join(finalSlice, "\n")))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
-
+}
 
 func testConfig(configStr string) (ConfigResult, bool) {
 	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
