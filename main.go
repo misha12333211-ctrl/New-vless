@@ -985,7 +985,8 @@ func isRuSNI(sni string) bool {
 }
 
 func setConfigNameUniversal(configURL string, name string) string {
-	escapedName := url.QueryEscape(name)
+	escapedName := url.PathEscape(name)
+	escapedName = strings.ReplaceAll(escapedName, "#", "%23") // 
 
 	if strings.HasPrefix(configURL, "vmess://") && len(configURL) > 8 {
 		b64 := configURL[8:]
