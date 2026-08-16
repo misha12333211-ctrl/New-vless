@@ -267,7 +267,7 @@ func main() {
 			tag = fmt.Sprintf("%s-%s", r.CountryCode, tag)
 		}
 
-		displayName := fmt.Sprintf("MiGiTi-PRO | %s | #%d", tag, i+1)
+		displayName := fmt.Sprintf("By MiGiTi SNI #%d", i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
