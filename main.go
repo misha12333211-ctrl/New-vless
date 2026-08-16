@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	maxConcurrency     = 64               // Увеличено параллельное тестирование для высокой скорости
-	maxOutputLimit     = 300              // Максимальное кол-во конфигов в итоговой подписке
+	maxConcurrency     = 64 // Высокопараллельное тестирование
+	maxOutputLimit     = 300 // Максимальное количество конфигов в итоговой подписке
 	pingTimeout        = 1000 * time.Millisecond
 	serviceTimeout     = 4500 * time.Millisecond
 	fetchConcurrency   = 20
@@ -57,38 +57,38 @@ type TargetService struct {
 
 var targetServices = []TargetService{
 	{
-		Name: "Google",
-		URL:  "https://www.google.com/generate_204",
+		Name:           "Google",
+		URL:            "https://www.google.com/generate_204",
 		ExpectedStatus: func(c int) bool { return c == 204 || c == 200 },
 	},
 	{
-		Name: "Telegram",
-		URL:  "https://t.me",
+		Name:           "Telegram",
+		URL:            "https://t.me",
 		ExpectedStatus: func(c int) bool { return c == 200 || c == 302 },
 	},
 	{
-		Name: "GitHub",
-		URL:  "https://github.com",
+		Name:           "GitHub",
+		URL:            "https://github.com",
 		ExpectedStatus: func(c int) bool { return c == 200 },
 	},
 	{
-		Name: "YouTube",
-		URL:  "https://www.youtube.com",
+		Name:           "YouTube",
+		URL:            "https://www.youtube.com",
 		ExpectedStatus: func(c int) bool { return c == 200 },
 	},
 	{
-		Name: "Instagram",
-		URL:  "https://www.instagram.com",
+		Name:           "Instagram",
+		URL:            "https://www.instagram.com",
 		ExpectedStatus: func(c int) bool { return c == 200 || c == 301 || c == 302 },
 	},
 	{
-		Name: "WhatsApp",
-		URL:  "https://web.whatsapp.com",
+		Name:           "WhatsApp",
+		URL:            "https://web.whatsapp.com",
 		ExpectedStatus: func(c int) bool { return c == 200 || c == 302 },
 	},
 	{
-		Name: "ChatGPT",
-		URL:  "https://chatgpt.com",
+		Name:           "ChatGPT",
+		URL:            "https://chatgpt.com",
 		ExpectedStatus: func(c int) bool { return c == 200 || c == 307 || c == 403 },
 	},
 }
@@ -111,12 +111,12 @@ var nearRUCountries = map[string]bool{
 }
 
 var (
-	geoCache sync.Map
+	geoCache    sync.Map
 	dnsResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 1500 * time.Millisecond}
-			return d.DialContext(ctx, "udp", "77.88.8.8:53") // Использование быстрых DNS Яндекса
+			return d.DialContext(ctx, "udp", "77.88.8.8:53") // Быстрый DNS Яндекса
 		},
 	}
 )
@@ -254,26 +254,24 @@ func main() {
 		}
 	}
 
-		var finalSlice []string
+	var finalSlice []string
 	for i, r := range selected {
 		displayName := fmt.Sprintf("By MiGiTi SNI #%d", i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-
 	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", len(finalSlice))
 
-			fmt.Println("=== [5/5] Запись результативных файлов ===")
-	// Используем директивы #profile-title для совместимости с v2rayNG
-	subscriptionHeader := "#profile-title: Go Engine By MiGiTi\n#profile-update-interval: 24\n#subscription-userinfo: upload=0; download=0; total=1073741824000; expire=0\n"
-	
+	fmt.Println("=== [5/5] Запись результативных файлов ===")
+	subscriptionHeader := "//profile-title: Go Engine By MiGiTi\n"
 	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
-	// Для Base64 подписки кодируем только список конфигов, без символов комментария в начале
-	b64Output := base64.StdEncoding.EncodeToString([]byte(strings.Join(finalSlice, "\n")))
+	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
+
+	fmt.Printf("Задание успешно выполнено за %v!\n", time.Since(startTime))
 }
 
 func testConfig(configStr string) (ConfigResult, bool) {
@@ -362,7 +360,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
-	// Динамический выбор порта через системный Listener с безопасным перехватом
+	// Динамический выбор порта через системный Listener
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, false
@@ -986,7 +984,7 @@ func isRuSNI(sni string) bool {
 
 func setConfigNameUniversal(configURL string, name string) string {
 	escapedName := url.PathEscape(name)
-	escapedName = strings.ReplaceAll(escapedName, "#", "%23") // 
+	escapedName = strings.ReplaceAll(escapedName, "#", "%23")
 
 	if strings.HasPrefix(configURL, "vmess://") && len(configURL) > 8 {
 		b64 := configURL[8:]
