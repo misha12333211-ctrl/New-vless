@@ -254,29 +254,21 @@ func main() {
 		}
 	}
 
-	var finalSlice []string
+		var finalSlice []string
 	for i, r := range selected {
-		tag := strings.ToUpper(r.Protocol)
-		if r.IsRuSNI {
-			tag += "-WHITE_SNI"
-		} else if r.HasBypassTech {
-			tag += "-ANTI_TSPU"
-		}
-
-		if r.CountryCode != "" {
-			tag = fmt.Sprintf("%s-%s", r.CountryCode, tag)
-		}
-
 		displayName := fmt.Sprintf("By MiGiTi SNI #%d", i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
+
 	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", len(finalSlice))
 
-	fmt.Println("=== [5/5] Запись результативных файлов ===")
-	rawOutput := strings.Join(finalSlice, "\n")
+		fmt.Println("=== [5/5] Запись результативных файлов ===")
+	subscriptionHeader := "//profile-title: Go Engine By MiGiTi\n"
+	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
+
 
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
