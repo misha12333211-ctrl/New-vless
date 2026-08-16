@@ -264,17 +264,17 @@ func main() {
 
 	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", len(finalSlice))
 
-		fmt.Println("=== [5/5] Запись результативных файлов ===")
-	subscriptionHeader := "//profile-title: Go Engine By MiGiTi\n"
+			fmt.Println("=== [5/5] Запись результативных файлов ===")
+	// Используем директивы #profile-title для совместимости с v2rayNG
+	subscriptionHeader := "#profile-title: Go Engine By MiGiTi\n#profile-update-interval: 24\n#subscription-userinfo: upload=0; download=0; total=1073741824000; expire=0\n"
+	
 	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
-
-	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
+	// Для Base64 подписки кодируем только список конфигов, без символов комментария в начале
+	b64Output := base64.StdEncoding.EncodeToString([]byte(strings.Join(finalSlice, "\n")))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
-	fmt.Printf("Задание успешно выполнено за %v!\n", time.Since(startTime))
-}
 
 func testConfig(configStr string) (ConfigResult, bool) {
 	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
