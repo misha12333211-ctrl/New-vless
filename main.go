@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -27,10 +28,10 @@ import (
 )
 
 const (
-	maxConcurrency     = 32  // Безопасное значение для GitHub Actions Runner (2 vCPU)
-	maxOutputLimit     = 300 // Максимальное количество конфигов в итоговой подписке
+	maxConcurrency     = 32  // Оптимальный параллелизм для GitHub Actions (2 vCPU)
+	maxOutputLimit     = 300 // Лимит конфигов в итоговой подписке
 	pingTimeout        = 1200 * time.Millisecond
-	serviceTimeout     = 5000 * time.Millisecond
+	serviceTimeout     = 6000 * time.Millisecond
 	fetchConcurrency   = 15
 	maxGeoCacheEntries = 20000
 )
@@ -117,7 +118,11 @@ var (
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 1500 * time.Millisecond}
-			return d.DialContext(ctx, "udp", "77.88.8.8:53")
+			conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
+			if err != nil {
+				return d.DialContext(ctx, "udp", "1.1.1.1:53")
+			}
+			return conn, nil
 		},
 	}
 )
@@ -138,7 +143,7 @@ func main() {
 	fmt.Printf("Успешно загружено источников: %d\n", len(sources))
 
 	fmt.Println("=== [2/5] Сбор, фильтрация и Base64 декодирование ===")
-	rawConfigs := make(chan string, 100000)
+	rawConfigs := make(chan string, 200000)
 	var wg sync.WaitGroup
 
 	tr := &http.Transport{
@@ -171,11 +176,9 @@ func main() {
 		}(src)
 	}
 
-	go func() {
-		wg.Wait()
-		close(rawConfigs)
-		tr.CloseIdleConnections()
-	}()
+	wg.Wait()
+	close(rawConfigs)
+	tr.CloseIdleConnections()
 
 	uniqueConfigs := make(map[string]bool)
 	for cfg := range rawConfigs {
@@ -343,7 +346,9 @@ func passTSPUBypassFilter(proto, port, sni, security, fullURL string) bool {
 func measureTCPPing(host string, port string) (time.Duration, bool) {
 	address := net.JoinHostPort(host, port)
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", address, pingTimeout)
+	
+	d := net.Dialer{Timeout: pingTimeout}
+	conn, err := d.Dial("tcp", address)
 	if err != nil {
 		return 0, false
 	}
@@ -351,14 +356,13 @@ func measureTCPPing(host string, port string) (time.Duration, bool) {
 	return time.Since(start), true
 }
 
-func getFreePort() (int, error) {
+func getFreePort() (int, net.Listener, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port, nil
+	return port, l, nil
 }
 
 func checkTargetServicesViaProxy(configStr string) (int, bool) {
@@ -367,10 +371,12 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 
-	socksPort, err := getFreePort()
+	socksPort, listener, err := getFreePort()
 	if err != nil {
 		return 0, false
 	}
+	// Закрываем listener непосредственно перед запуском sing-box для минимизации риска race condition
+	_ = listener.Close()
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
 	if err != nil {
@@ -401,8 +407,8 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	defer func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
 		}
+		_ = cmd.Wait()
 	}()
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
@@ -825,32 +831,34 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
 	content = strings.TrimSpace(content)
 
-	for i := 0; i < 2; i++ {
-		cleaned := cleanBase64Fast(content)
-		if len(cleaned) < 16 {
-			break
-		}
-		decoded, err := decodeBase64Flex(cleaned)
-		if err == nil && len(decoded) > 0 {
-			strDec := string(decoded)
-			if isProxyProtocol(strDec) || strings.Contains(strDec, "://") {
-				content = strDec
-			} else {
-				break
-			}
-		} else {
-			break
-		}
-	}
-
+	// Разбор Base64 по строкам вместо декодирования всего файла целиком
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
 		if isProxyProtocol(line) {
 			out <- line
+			continue
+		}
+
+		// Если строка является цельным Base64 блоком
+		cleaned := cleanBase64Fast(line)
+		if len(cleaned) >= 16 {
+			if decoded, err := decodeBase64Flex(cleaned); err == nil && len(decoded) > 0 {
+				subScanner := bufio.NewScanner(bytes.NewReader(decoded))
+				for subScanner.Scan() {
+					subLine := strings.TrimSpace(subScanner.Text())
+					if isProxyProtocol(subLine) {
+						out <- subLine
+					}
+				}
+			}
 		}
 	}
 }
@@ -997,7 +1005,7 @@ func setConfigNameUniversal(configURL string, name string) string {
 		decoded, err := decodeBase64Flex(b64)
 		if err == nil {
 			var vmap map[string]interface{}
-			if err := json.Unmarshal(decoded, &vmap); err == nil {
+			if err := json.Unmarshal(decoded, &vmap); err == nil && vmap != nil {
 				vmap["ps"] = name
 				if newJSON, err := json.Marshal(vmap); err == nil {
 					return "vmess://" + base64.StdEncoding.EncodeToString(newJSON)
@@ -1056,7 +1064,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		decoded, err := decodeBase64Flex(b64)
 		if err == nil {
 			var vmap map[string]interface{}
-			if err := json.Unmarshal(decoded, &vmap); err == nil {
+			if err := json.Unmarshal(decoded, &vmap); err == nil && vmap != nil {
 				host, _ = vmap["add"].(string)
 				if p, ok := vmap["port"]; ok {
 					switch v := p.(type) {
