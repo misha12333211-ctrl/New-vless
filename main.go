@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bufio"
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -26,13 +25,15 @@ import (
 	"time"
 )
 
-const (
-	maxConcurrency     = 64 // Высокопараллельное тестирование
-	maxOutputLimit     = 300 // Максимальное количество конфигов в итоговой подписке
-	pingTimeout        = 1000 * time.Millisecond
-	serviceTimeout     = 4500 * time.Millisecond
-	fetchConcurrency   = 20
-	maxGeoCacheEntries = 20000
+// === Настройки Производительности для GitHub Actions ===
+var (
+	numCPU           = runtime.NumCPU()
+	preflightWorkers = numCPU * 64 // Легкие проверочные TCP/TLS горутины
+	singboxWorkers   = numCPU * 8  // Тяжелые интеграционные проверочные горутины
+	maxOutputLimit   = 300
+	pingTimeout      = 800 * time.Millisecond
+	serviceTimeout   = 3500 * time.Millisecond
+	fetchConcurrency = 32
 )
 
 type ConfigResult struct {
@@ -56,41 +57,13 @@ type TargetService struct {
 }
 
 var targetServices = []TargetService{
-	{
-		Name:           "Google",
-		URL:            "https://www.google.com/generate_204",
-		ExpectedStatus: func(c int) bool { return c == 204 || c == 200 },
-	},
-	{
-		Name:           "Telegram",
-		URL:            "https://t.me",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 302 },
-	},
-	{
-		Name:           "GitHub",
-		URL:            "https://github.com",
-		ExpectedStatus: func(c int) bool { return c == 200 },
-	},
-	{
-		Name:           "YouTube",
-		URL:            "https://www.youtube.com",
-		ExpectedStatus: func(c int) bool { return c == 200 },
-	},
-	{
-		Name:           "Instagram",
-		URL:            "https://www.instagram.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 301 || c == 302 },
-	},
-	{
-		Name:           "WhatsApp",
-		URL:            "https://web.whatsapp.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 302 },
-	},
-	{
-		Name:           "ChatGPT",
-		URL:            "https://chatgpt.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 307 || c == 403 },
-	},
+	{Name: "Google", URL: "https://www.google.com/generate_204", ExpectedStatus: func(c int) bool { return c == 204 || c == 200 }},
+	{Name: "Telegram", URL: "https://t.me", ExpectedStatus: func(c int) bool { return c == 200 || c == 302 }},
+	{Name: "GitHub", URL: "https://github.com", ExpectedStatus: func(c int) bool { return c == 200 }},
+	{Name: "YouTube", URL: "https://www.youtube.com", ExpectedStatus: func(c int) bool { return c == 200 }},
+	{Name: "Instagram", URL: "https://www.instagram.com", ExpectedStatus: func(c int) bool { return c == 200 || c == 301 || c == 302 }},
+	{Name: "WhatsApp", URL: "https://web.whatsapp.com", ExpectedStatus: func(c int) bool { return c == 200 || c == 302 }},
+	{Name: "ChatGPT", URL: "https://chatgpt.com", ExpectedStatus: func(c int) bool { return c == 200 || c == 307 || c == 403 }},
 }
 
 var ruWhiteSNIs = []string{
@@ -115,45 +88,47 @@ var (
 	dnsResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 1500 * time.Millisecond}
-			return d.DialContext(ctx, "udp", "77.88.8.8:53") // Быстрый DNS Яндекса
+			d := net.Dialer{Timeout: 1000 * time.Millisecond}
+			return d.DialContext(ctx, "udp", "77.88.8.8:53")
 		},
 	}
+	sharedHTTPClient *http.Client
 )
+
+func init() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	tr := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:          500,
+		MaxIdleConnsPerHost:   50,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 4 * time.Second,
+		DisableKeepAlives:     false,
+	}
+	sharedHTTPClient = &http.Client{
+		Timeout:   8 * time.Second,
+		Transport: tr,
+	}
+}
 
 func main() {
 	startTime := time.Now()
 
-	fmt.Println("=== [1/5] Инициализация среды и ядра sing-box ===")
+	fmt.Println("=== [1/5] Инициализация ядра sing-box ===")
 	ensureCoreAvailable()
 
 	sources, err := readLines("sources.txt")
 	if err != nil || len(sources) == 0 {
-		fmt.Printf("Внимание: sources.txt не найден или пуст: %v. Создаем пустые выходы.\n", err)
+		fmt.Printf("Ошибка: sources.txt не найден или пуст: %v. Создаем пустые выходы.\n", err)
 		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
-	fmt.Printf("Успешно загружено источников: %d\n", len(sources))
+	fmt.Printf("Загружено источников: %d (Рабочие потоки: Pre-flight=%d, Sing-box=%d)\n", len(sources), preflightWorkers, singboxWorkers)
 
-	fmt.Println("=== [2/5] Сбор, фильтрация и Base64 декодирование ===")
-	rawConfigs := make(chan string, 200000)
+	fmt.Println("=== [2/5] Высокоскоростной сбор и декодирование подписок ===")
+	rawConfigs := make(chan string, 500000)
 	var wg sync.WaitGroup
-
-	tr := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   20,
-		IdleConnTimeout:       15 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Second,
-		DisableKeepAlives:     false,
-	}
-
-	sharedHTTPClient := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: tr,
-	}
-
 	fetchSem := make(chan struct{}, fetchConcurrency)
 
 	for _, src := range sources {
@@ -173,52 +148,86 @@ func main() {
 	go func() {
 		wg.Wait()
 		close(rawConfigs)
-		tr.CloseIdleConnections()
 	}()
 
-	uniqueConfigs := make(map[string]bool)
+	uniqueConfigs := make(map[string]struct{}, 100000)
 	for cfg := range rawConfigs {
 		cfg = sanitizeProxyURL(cfg)
-		if cfg != "" && len(cfg) < 8192 && isProxyProtocol(cfg) {
-			uniqueConfigs[cfg] = true
+		if cfg != "" && len(cfg) < 4096 && isProxyProtocol(cfg) {
+			uniqueConfigs[cfg] = struct{}{}
 		}
 	}
 
 	totalConfigs := len(uniqueConfigs)
-	fmt.Printf("Валидных уникальных прокси-ссылок в базе: %d\n", totalConfigs)
+	fmt.Printf("Валидных уникальных прокси в базе: %d\n", totalConfigs)
 
 	if totalConfigs == 0 {
-		fmt.Println("Нет валидных конфигураций для тестирования. Завершение работы.")
+		fmt.Println("Нет валидных конфигураций. Завершение.")
 		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
 
-	fmt.Println("=== [3/5] Оптимизированный аудит ТСПУ + Высокоскоростное тестирование ===")
-	resultsChan := make(chan ConfigResult, totalConfigs)
-	semaphore := make(chan struct{}, maxConcurrency)
-	var testWg sync.WaitGroup
-	var processedCount int64
+	fmt.Println("=== [3/5] Двухфазное ультра-быстрое тестирование ТСПУ ===")
+
+	// Фаза 3.1: Нативный Go TCP/TLS Pre-flight фильтр
+	type preflightResult struct {
+		url     string
+		latency time.Duration
+	}
+	preflightPassed := make(chan preflightResult, totalConfigs)
+	preflightSem := make(chan struct{}, preflightWorkers)
+	var pfWg sync.WaitGroup
+	var pfProcessed int64
 
 	for cfg := range uniqueConfigs {
-		testWg.Add(1)
+		pfWg.Add(1)
 		go func(c string) {
-			defer testWg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			defer pfWg.Done()
+			preflightSem <- struct{}{}
+			defer func() { <-preflightSem }()
 
-			if res, ok := testConfig(c); ok {
-				resultsChan <- res
+			if lat, ok := fastPreflightCheck(c); ok {
+				preflightPassed <- preflightResult{url: c, latency: lat}
 			}
 
-			curr := atomic.AddInt64(&processedCount, 1)
-			if curr%200 == 0 || curr == int64(totalConfigs) {
-				fmt.Printf("Обработано конфигураций: %d / %d\r", curr, totalConfigs)
+			curr := atomic.AddInt64(&pfProcessed, 1)
+			if curr%1000 == 0 || curr == int64(totalConfigs) {
+				fmt.Printf("Pre-flight пройдено: %d / %d\r", curr, totalConfigs)
 			}
 		}(cfg)
 	}
 
-	testWg.Wait()
+	pfWg.Wait()
+	close(preflightPassed)
+	fmt.Printf("\nPre-flight фильтрация завершена. Прошло проверку: %d прокси.\n", len(preflightPassed))
+
+	// Фаза 3.2: Тестирование сервисов через sing-box
+	resultsChan := make(chan ConfigResult, len(preflightPassed))
+	sbSem := make(chan struct{}, singboxWorkers)
+	var sbWg sync.WaitGroup
+	var sbProcessed int64
+	totalPreflightPassed := len(preflightPassed)
+
+	for pf := range preflightPassed {
+		sbWg.Add(1)
+		go func(item preflightResult) {
+			defer sbWg.Done()
+			sbSem <- struct{}{}
+			defer func() { <-sbSem }()
+
+			if res, ok := testConfigFull(item.url, item.latency); ok {
+				resultsChan <- res
+			}
+
+			curr := atomic.AddInt64(&sbProcessed, 1)
+			if curr%50 == 0 || curr == int64(totalPreflightPassed) {
+				fmt.Printf("Sing-box проверено: %d / %d\r", curr, totalPreflightPassed)
+			}
+		}(pf)
+	}
+
+	sbWg.Wait()
 	close(resultsChan)
 	fmt.Println("\nТестирование полностью завершено.")
 
@@ -229,7 +238,7 @@ func main() {
 		}
 	}
 
-	fmt.Printf("=== [4/5] Ранжирование и оптимизация под РФ (Прошло: %d) ===\n", len(validResults))
+	fmt.Printf("=== [4/5] Ранжирование под РФ (Успешных: %d) ===\n", len(validResults))
 
 	sort.Slice(validResults, func(i, j int) bool {
 		if validResults[i].ServiceSuccess == validResults[j].ServiceSuccess {
@@ -242,7 +251,7 @@ func main() {
 	})
 
 	var selected []ConfigResult
-	usedMap := make(map[string]bool)
+	usedMap := make(map[string]bool, maxOutputLimit)
 
 	for _, res := range validResults {
 		if len(selected) >= maxOutputLimit {
@@ -261,9 +270,9 @@ func main() {
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", len(finalSlice))
+	fmt.Printf("Итоговая подписка содержит: %d прокси.\n", len(finalSlice))
 
-	fmt.Println("=== [5/5] Запись результативных файлов ===")
+	fmt.Println("=== [5/5] Запись файлов результатов ===")
 	subscriptionHeader := "//profile-title: Go Engine By MiGiTi\n"
 	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
@@ -271,29 +280,56 @@ func main() {
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
-	fmt.Printf("Задание успешно выполнено за %v!\n", time.Since(startTime))
+	fmt.Printf("Вся обработка выполнена за %v!\n", time.Since(startTime))
 }
 
-func testConfig(configStr string) (ConfigResult, bool) {
-	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
+func fastPreflightCheck(configStr string) (time.Duration, bool) {
+	host, port, sni, _, _, proto, security, _ := parseConfigDetails(configStr)
 	if host == "" || port == "" {
-		return ConfigResult{}, false
+		return 0, false
 	}
-
-	ruSNI := isRuSNI(sni)
-	hasBypassTech := security == "reality" || proto == "hysteria2" || proto == "hy2" || proto == "tuic" || flow != "" || strings.Contains(configStr, "fp=")
 
 	if !passTSPUBypassFilter(proto, port, sni, security, configStr) {
-		return ConfigResult{}, false
+		return 0, false
 	}
 
-	// Быстрая предварительная проверка TCP сокета (Pre-flight check)
-	realPing, ok := measureTCPPing(host, port)
-	if !ok || realPing > pingTimeout {
-		return ConfigResult{}, false
+	address := net.JoinHostPort(host, port)
+	start := time.Now()
+	
+	dialer := &net.Dialer{Timeout: pingTimeout}
+	conn, err := dialer.Dial("tcp", address)
+	if err != nil {
+		return 0, false
+	}
+	
+	latency := time.Since(start)
+
+	// TLS Handshake тест для TLS/Reality
+	if security == "tls" || security == "reality" {
+		_ = conn.SetDeadline(time.Now().Add(600 * time.Millisecond))
+		serverName := sni
+		if serverName == "" {
+			serverName = host
+		}
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         serverName,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			_ = conn.Close()
+			return 0, false
+		}
+		_ = tlsConn.Close()
+	} else {
+		_ = conn.Close()
 	}
 
-	// Полная функциональная проверка через локальный sing-box
+	return latency, true
+}
+
+func testConfigFull(configStr string, realPing time.Duration) (ConfigResult, bool) {
+	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
+
 	passedServices, ok := checkTargetServicesViaProxy(configStr)
 	if !ok || passedServices < 1 {
 		return ConfigResult{}, false
@@ -301,6 +337,8 @@ func testConfig(configStr string) (ConfigResult, bool) {
 
 	countryCode := getIPCountryCode(host)
 	isNearRU := nearRUCountries[countryCode]
+	ruSNI := isRuSNI(sni)
+	hasBypassTech := security == "reality" || proto == "hysteria2" || proto == "hy2" || proto == "tuic" || flow != "" || strings.Contains(configStr, "fp=")
 
 	adjustedPing := realPing
 	if countryCode == "RU" {
@@ -327,14 +365,12 @@ func testConfig(configStr string) (ConfigResult, bool) {
 }
 
 func passTSPUBypassFilter(proto, port, sni, security, fullURL string) bool {
-	// Отсечение незащищенного Shadowsocks и VMess/VLESS без шифрования
 	if (proto == "ss" || proto == "ssr") && security == "none" && !strings.Contains(fullURL, "plugin=") {
 		return false
 	}
 	if (proto == "vless" || proto == "vmess") && (security == "none" || security == "") {
 		return false
 	}
-	// Для VLESS/VMess/Trojan обязателен TLS или REALITY
 	if proto == "vless" || proto == "vmess" || proto == "trojan" {
 		if security != "reality" && security != "tls" {
 			return false
@@ -343,30 +379,18 @@ func passTSPUBypassFilter(proto, port, sni, security, fullURL string) bool {
 	return true
 }
 
-func measureTCPPing(host string, port string) (time.Duration, bool) {
-	address := net.JoinHostPort(host, port)
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", address, pingTimeout)
-	if err != nil {
-		return 0, false
-	}
-	_ = conn.Close()
-	return time.Since(start), true
-}
-
 func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	corePath := findCoreExecutable()
 	if corePath == "" {
 		return 0, false
 	}
 
-	// Динамический выбор порта через системный Listener
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, false
 	}
 	socksPort := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close() // Высвобождаем порт прямо перед запуском процесса
+	_ = l.Close()
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
 	if err != nil {
@@ -403,14 +427,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 35; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
+	for i := 0; i < 20; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 15*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -422,14 +446,13 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		Proxy:               http.ProxyURL(proxyURL),
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: 2500 * time.Millisecond,
-		ForceAttemptHTTP2:   false,
+		TLSHandshakeTimeout: 1500 * time.Millisecond,
 	}
 	defer httpTransport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   2500 * time.Millisecond,
+		Timeout:   1800 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
@@ -439,7 +462,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 2000*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
@@ -452,7 +475,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 			if err != nil {
 				return
 			}
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256*1024))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
 
 			if s.ExpectedStatus(resp.StatusCode) {
@@ -643,12 +666,6 @@ func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 
 	config := map[string]interface{}{
 		"log": map[string]interface{}{"level": "panic"},
-		"dns": map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{"address": "https://77.88.8.8/dns-query", "strategy": "ipv4_only"},
-				{"address": "https://1.1.1.1/dns-query", "strategy": "ipv4_only"},
-			},
-		},
 		"inbounds": []map[string]interface{}{
 			{
 				"type":        "socks",
@@ -705,8 +722,7 @@ func ensureCoreAvailable() {
 		return
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(downloadURL)
+	resp, err := sharedHTTPClient.Get(downloadURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			_ = resp.Body.Close()
@@ -908,7 +924,7 @@ func isProxyProtocol(line string) bool {
 func getIPCountryCode(host string) string {
 	ipStr := host
 	if net.ParseIP(host) == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 		defer cancel()
 		ips, err := dnsResolver.LookupHost(ctx, host)
 		if err != nil || len(ips) == 0 {
@@ -921,8 +937,15 @@ func getIPCountryCode(host string) string {
 		return val.(string)
 	}
 
-	client := &http.Client{Timeout: 800 * time.Millisecond}
-	resp, err := client.Get("https://freeipapi.com/api/json/" + ipStr)
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer reqCancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", "https://freeipapi.com/api/json/"+ipStr, nil)
+	if err != nil {
+		return ""
+	}
+
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return ""
 	}
@@ -1045,7 +1068,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		}
 	}
 
-	if strings.HasPrefix(configStr, "vmess://") && len(configStr) > 8 {
+	if strings.HasPrefix(configURL, "vmess://") && len(configStr) > 8 {
 		b64 := configStr[8:]
 		if idx := strings.Index(b64, "#"); idx != -1 {
 			b64 = b64[:idx]
