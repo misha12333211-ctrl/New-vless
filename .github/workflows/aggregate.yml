@@ -2,7 +2,7 @@ name: Aggregate Subscriptions
 
 on:
   schedule:
-    - cron: '0 */2 * * *' 
+    - cron: '0 */7 * * *' 
   workflow_dispatch: # Возможность запустить вручную одной кнопкой
 
 jobs:
