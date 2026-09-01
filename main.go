@@ -1,11 +1,11 @@
 package main
 
 import (
-    "compress/gzip"
 	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,12 +30,12 @@ import (
 )
 
 const (
-	maxConcurrency     = 32  // Оптимальный параллелизм для GitHub Actions (2 vCPU)
+	maxConcurrency     = 16  // Снижено до 16 для предотвращения OOM и блокировок GitHub Runner
 	maxOutputLimit     = 300 // Лимит конфигов в итоговой подписке
-	pingTimeout        = 1200 * time.Millisecond
-	serviceTimeout     = 6000 * time.Millisecond
-	fetchConcurrency   = 15
-	maxGeoCacheEntries = 20000
+	pingTimeout        = 1000 * time.Millisecond
+	serviceTimeout     = 5000 * time.Millisecond
+	fetchConcurrency   = 8
+	maxGeoCacheEntries = 10000
 )
 
 type ConfigResult struct {
@@ -78,21 +79,6 @@ var targetServices = []TargetService{
 		URL:            "https://www.youtube.com",
 		ExpectedStatus: func(c int) bool { return c == 200 },
 	},
-	{
-		Name:           "Instagram",
-		URL:            "https://www.instagram.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 301 || c == 302 },
-	},
-	{
-		Name:           "WhatsApp",
-		URL:            "https://web.whatsapp.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 302 },
-	},
-	{
-		Name:           "ChatGPT",
-		URL:            "https://chatgpt.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 307 || c == 403 },
-	},
 }
 
 var ruWhiteSNIs = []string{
@@ -118,7 +104,7 @@ var (
 	dnsResolver  = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 1500 * time.Millisecond}
+			d := net.Dialer{Timeout: 1000 * time.Millisecond}
 			conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
 			if err != nil {
 				return d.DialContext(ctx, "udp", "1.1.1.1:53")
@@ -144,20 +130,20 @@ func main() {
 	fmt.Printf("Успешно загружено источников: %d\n", len(sources))
 
 	fmt.Println("=== [2/5] Сбор, фильтрация и Base64 декодирование ===")
-	rawConfigs := make(chan string, 200000)
+	rawConfigs := make(chan string, 100000)
 	var wg sync.WaitGroup
 
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          500,
-		MaxIdleConnsPerHost:   50,
-		IdleConnTimeout:       30 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		DisableKeepAlives:     false,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       15 * time.Second,
+		ResponseHeaderTimeout: 8 * time.Second,
+		DisableKeepAlives:     true,
 	}
 
 	sharedHTTPClient := &http.Client{
-		Timeout:   15 * time.Second,
+		Timeout:   10 * time.Second,
 		Transport: tr,
 	}
 
@@ -184,7 +170,7 @@ func main() {
 	uniqueConfigs := make(map[string]bool)
 	for cfg := range rawConfigs {
 		cfg = sanitizeProxyURL(cfg)
-		if cfg != "" && len(cfg) < 8192 && isProxyProtocol(cfg) {
+		if cfg != "" && len(cfg) < 4096 && isProxyProtocol(cfg) {
 			uniqueConfigs[cfg] = true
 		}
 	}
@@ -198,6 +184,9 @@ func main() {
 		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
+
+	// Освобождаем память перед тестированием
+	debug.FreeOSMemory()
 
 	fmt.Println("=== [3/5] Оптимизированный аудит ТСПУ + Высокоскоростное тестирование ===")
 	resultsChan := make(chan ConfigResult, totalConfigs)
@@ -277,11 +266,9 @@ func main() {
 
 	fmt.Println("=== [5/5] Запись результативных файлов ===")
 
-	// Время обновления в MSK (UTC+3)
 	mskLoc := time.FixedZone("MSK", 3*3600)
 	updateTimeStr := time.Now().In(mskLoc).Format("2006-01-02 15:04:05")
 
-	// Формирование полного служебного хедера подписки
 	subscriptionHeader := fmt.Sprintf("//profile-title: MIGITI Subscriptions\n"+
 		"//profile-update-interval: 1\n"+
 		"//subscription-userinfo: upload=0; download=0; total=1073741824000; expire=0\n"+
@@ -300,6 +287,7 @@ func main() {
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
 	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
+	debug.FreeOSMemory()
 	fmt.Printf("Задание успешно выполнено за %v!\n", time.Since(startTime))
 }
 
@@ -400,7 +388,6 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	// Важно закрыть сокет, чтобы sing-box мог занять порт
 	_ = listener.Close()
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
@@ -425,7 +412,6 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	cmd := exec.CommandContext(ctx, corePath, "run", "-c", tmpConfigPath)
 
-	// Гарантия жесткого принудительного убийства процессов на Linux/Unix
 	if runtime.GOOS != "windows" {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
@@ -447,14 +433,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 40; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 25*time.Millisecond)
+	for i := 0; i < 20; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -466,14 +452,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		Proxy:               http.ProxyURL(proxyURL),
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: 2000 * time.Millisecond,
+		TLSHandshakeTimeout: 1500 * time.Millisecond,
 		ForceAttemptHTTP2:   false,
 	}
 	defer httpTransport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   2200 * time.Millisecond,
+		Timeout:   1800 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
@@ -483,7 +469,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 2000*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
@@ -496,7 +482,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 			if err != nil {
 				return
 			}
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256*1024))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 			_ = resp.Body.Close()
 
 			if s.ExpectedStatus(resp.StatusCode) {
@@ -844,17 +830,17 @@ func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512*1024))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 128*1024))
 			_ = resp.Body.Close()
 		}
 		return
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512*1024))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 128*1024))
 		_ = resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
 	if err != nil {
 		return
 	}
@@ -867,7 +853,7 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024)
+	scanner.Buffer(buf, 5*1024*1024)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -946,7 +932,7 @@ func isProxyProtocol(line string) bool {
 func getIPCountryCode(host string) string {
 	ipStr := host
 	if net.ParseIP(host) == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 		defer cancel()
 		ips, err := dnsResolver.LookupHost(ctx, host)
 		if err != nil || len(ips) == 0 {
@@ -963,9 +949,10 @@ func getIPCountryCode(host string) string {
 		return ""
 	}
 
-	client := &http.Client{Timeout: 800 * time.Millisecond}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
 	resp, err := client.Get("https://freeipapi.com/api/json/" + ipStr)
 	if err != nil {
+		geoCache.Store(ipStr, "") // Записываем пустой ответ, чтобы не делать повторных запросов при ошибках
 		return ""
 	}
 	defer resp.Body.Close()
@@ -979,6 +966,7 @@ func getIPCountryCode(host string) string {
 		}
 		return res.CountryCode
 	}
+	geoCache.Store(ipStr, "")
 	return ""
 }
 
