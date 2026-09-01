@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	maxConcurrency     = 16  // Снижено до 16 для предотвращения OOM и блокировок GitHub Runner
+	maxConcurrency     = 200  // Снижено до 16 для предотвращения OOM и блокировок GitHub Runner
 	maxOutputLimit     = 300 // Лимит конфигов в итоговой подписке
 	pingTimeout        = 1000 * time.Millisecond
 	serviceTimeout     = 5000 * time.Millisecond
