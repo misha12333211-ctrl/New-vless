@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/tar"
-	"archive/zip"
 	"bufio"
 	"bytes"
 	"compress/gzip"
