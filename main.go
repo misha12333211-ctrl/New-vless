@@ -47,9 +47,17 @@ type ConfigResult struct {
 	SNI            string
 	Protocol       string
 	CountryCode    string
+	ISP            string
+	IP             string
 	IsNearRU       bool
 	IsRuSNI        bool
 	HasBypassTech  bool
+}
+
+type GeoInfo struct {
+	IP          string
+	CountryCode string
+	ISP         string
 }
 
 type TargetService struct {
@@ -185,7 +193,6 @@ func main() {
 		return
 	}
 
-	// Освобождаем память перед тестированием
 	debug.FreeOSMemory()
 
 	fmt.Println("=== [3/5] Оптимизированный аудит ТСПУ + Высокоскоростное тестирование ===")
@@ -256,7 +263,19 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		displayName := fmt.Sprintf("MiGiTi #%d | TG: MiGiTi_official_channel", i+1)
+		flag := countryCodeToFlag(r.CountryCode)
+		countryStr := r.CountryCode
+		if countryStr == "" {
+			countryStr = "LOC"
+		}
+
+		ispStr := r.ISP
+		if ispStr == "" {
+			ispStr = "Server"
+		}
+
+		// Формируем эстетичное наименование: 🇩🇪 DE | Hetzner | MiGiTi #1
+		displayName := fmt.Sprintf("%s %s | %s | MiGiTi #%d", flag, countryStr, ispStr, i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
@@ -314,17 +333,17 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	countryCode := getIPCountryCode(host)
-	isNearRU := nearRUCountries[countryCode]
+	geoInfo := getGeoInfo(host)
+	isNearRU := nearRUCountries[geoInfo.CountryCode]
 
 	adjustedPing := realPing
-	if countryCode == "RU" {
+	if geoInfo.CountryCode == "RU" {
 		adjustedPing = time.Duration(float64(realPing) * 0.20)
 	} else if isNearRU {
 		adjustedPing = time.Duration(float64(realPing) * 0.50)
 	}
 
-	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, countryCode, ruSNI, hasBypassTech)
+	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, geoInfo.CountryCode, ruSNI, hasBypassTech)
 
 	return ConfigResult{
 		URL:            configStr,
@@ -334,7 +353,9 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		ServiceSuccess: passedServices,
 		SNI:            sni,
 		Protocol:       proto,
-		CountryCode:    countryCode,
+		CountryCode:    geoInfo.CountryCode,
+		ISP:            geoInfo.ISP,
+		IP:             geoInfo.IP,
 		IsNearRU:       isNearRU,
 		IsRuSNI:        ruSNI,
 		HasBypassTech:  hasBypassTech,
@@ -929,45 +950,97 @@ func isProxyProtocol(line string) bool {
 		strings.HasPrefix(lower, "tuic://")
 }
 
-func getIPCountryCode(host string) string {
+// Конвертация кода страны (ISO 3166-1 alpha-2) в Unicode-флаг Emoji
+func countryCodeToFlag(code string) string {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if len(code) != 2 {
+		return "🌐"
+	}
+	runes := []rune(code)
+	if runes[0] < 'A' || runes[0] > 'Z' || runes[1] < 'A' || runes[1] > 'Z' {
+		return "🌐"
+	}
+	return string([]rune{runes[0] + 0x1F1A5, runes[1] + 0x1F1A5})
+}
+
+// Полный GeoIP + ISP запрос
+func getGeoInfo(host string) GeoInfo {
 	ipStr := host
 	if net.ParseIP(host) == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 		defer cancel()
 		ips, err := dnsResolver.LookupHost(ctx, host)
 		if err != nil || len(ips) == 0 {
-			return ""
+			return GeoInfo{IP: host, CountryCode: "", ISP: "Unknown"}
 		}
 		ipStr = ips[0]
 	}
 
 	if val, ok := geoCache.Load(ipStr); ok {
-		return val.(string)
+		return val.(GeoInfo)
 	}
 
 	if atomic.LoadInt64(&geoCacheSize) > maxGeoCacheEntries {
-		return ""
+		return GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
 	}
 
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	resp, err := client.Get("https://freeipapi.com/api/json/" + ipStr)
+	client := &http.Client{Timeout: 800 * time.Millisecond}
+	// Запрос к ip-api.com для получения кода страны и провайдера
+	resp, err := client.Get("http://ip-api.com/json/" + ipStr + "?fields=countryCode,isp,org,as")
 	if err != nil {
-		geoCache.Store(ipStr, "") // Записываем пустой ответ, чтобы не делать повторных запросов при ошибках
-		return ""
+		emptyInfo := GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
+		geoCache.Store(ipStr, emptyInfo)
+		return emptyInfo
 	}
 	defer resp.Body.Close()
 
 	var res struct {
 		CountryCode string `json:"countryCode"`
+		ISP         string `json:"isp"`
+		Org         string `json:"org"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.CountryCode != "" {
-		if atomic.AddInt64(&geoCacheSize, 1) <= maxGeoCacheEntries {
-			geoCache.Store(ipStr, res.CountryCode)
+
+	if json.NewDecoder(resp.Body).Decode(&res) == nil {
+		ispName := res.ISP
+		if ispName == "" {
+			ispName = res.Org
 		}
-		return res.CountryCode
+		if ispName == "" {
+			ispName = "Server"
+		}
+
+		// Форматирование наименования ISP (очистка лишних слов и символов)
+		ispName = cleanISPName(ispName)
+
+		info := GeoInfo{
+			IP:          ipStr,
+			CountryCode: res.CountryCode,
+			ISP:         ispName,
+		}
+
+		if atomic.AddInt64(&geoCacheSize, 1) <= maxGeoCacheEntries {
+			geoCache.Store(ipStr, info)
+		}
+		return info
 	}
-	geoCache.Store(ipStr, "")
-	return ""
+
+	emptyInfo := GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
+	geoCache.Store(ipStr, emptyInfo)
+	return emptyInfo
+}
+
+func cleanISPName(name string) string {
+	name = strings.ReplaceAll(name, "|", "")
+	name = strings.ReplaceAll(name, "#", "")
+	words := strings.Fields(name)
+	if len(words) > 0 {
+		// Берём 1-2 главных слова для краткости
+		if len(words) >= 2 && len(words[0]) <= 3 {
+			return words[0] + " " + words[1]
+		}
+		return words[0]
+	}
+	return "Server"
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string, ruSNI bool, hasBypassTech bool) int {
