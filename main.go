@@ -1089,8 +1089,8 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		}
 	}
 
-	if strings.HasPrefix(configURL, "vmess://") && len(configURL) > 8 {
-		b64 := configURL[8:]
+	if strings.HasPrefix(configStr, "vmess://") && len(configURL) > 8 {
+		b64 := configStr[8:]
 		if idx := strings.Index(b64, "#"); idx != -1 {
 			b64 = b64[:idx]
 		}
