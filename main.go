@@ -5,7 +5,6 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -24,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -227,13 +227,19 @@ func main() {
 	fmt.Println("\nТестирование полностью завершено.")
 
 	var validResults []ConfigResult
+	protoStats := make(map[string]int)
+
 	for res := range resultsChan {
 		if res.Score > 0 && res.ServiceSuccess >= 1 {
 			validResults = append(validResults, res)
+			protoStats[res.Protocol]++
 		}
 	}
 
 	fmt.Printf("=== [4/5] Ранжирование и оптимизация под РФ (Прошло: %d) ===\n", len(validResults))
+	for proto, count := range protoStats {
+		fmt.Printf("  • %s: %d шт.\n", strings.ToUpper(proto), count)
+	}
 
 	sort.Slice(validResults, func(i, j int) bool {
 		if validResults[i].ServiceSuccess == validResults[j].ServiceSuccess {
@@ -393,6 +399,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
+	// Важно закрыть сокет, чтобы sing-box мог занять порт
 	_ = listener.Close()
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
@@ -405,17 +412,22 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 	tmpConfigPath := tmpConfigFile.Name()
-	_, _ = tmpConfigFile.Write(singBoxConfigJSON)
-	_ = tmpConfigFile.Close()
-
 	defer func() {
 		_ = os.Remove(tmpConfigPath)
 	}()
+
+	_, _ = tmpConfigFile.Write(singBoxConfigJSON)
+	_ = tmpConfigFile.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, corePath, "run", "-c", tmpConfigPath)
+
+	// Гарантия жесткого принудительного убийства процессов на Linux/Unix
+	if runtime.GOOS != "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 
 	if err := cmd.Start(); err != nil {
 		return 0, false
@@ -423,7 +435,11 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	defer func() {
 		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+			if runtime.GOOS != "windows" {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			} else {
+				_ = cmd.Process.Kill()
+			}
 		}
 		_ = cmd.Wait()
 	}()
@@ -709,7 +725,7 @@ func ensureCoreAvailable() {
 
 	fmt.Println("Автоматическая установка sing-box Core...")
 	var downloadURL string
-	version := "1.8.11"
+	version := "1.10.1"
 
 	switch runtime.GOOS {
 	case "linux":
@@ -957,8 +973,9 @@ func getIPCountryCode(host string) string {
 		CountryCode string `json:"countryCode"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.CountryCode != "" {
-		geoCache.Store(ipStr, res.CountryCode)
-		atomic.AddInt64(&geoCacheSize, 1)
+		if atomic.AddInt64(&geoCacheSize, 1) <= maxGeoCacheEntries {
+			geoCache.Store(ipStr, res.CountryCode)
+		}
 		return res.CountryCode
 	}
 	return ""
@@ -1071,8 +1088,8 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		}
 	}
 
-	if strings.HasPrefix(configStr, "vmess://") && len(configStr) > 8 {
-		b64 := configStr[8:]
+	if strings.HasPrefix(configURL, "vmess://") && len(configURL) > 8 {
+		b64 := configURL[8:]
 		if idx := strings.Index(b64, "#"); idx != -1 {
 			b64 = b64[:idx]
 		}
@@ -1080,7 +1097,9 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 		if err == nil {
 			var vmap map[string]interface{}
 			if err := json.Unmarshal(decoded, &vmap); err == nil && vmap != nil {
-				host, _ = vmap["add"].(string)
+				if h, ok := vmap["add"].(string); ok {
+					host = h
+				}
 				if p, ok := vmap["port"]; ok {
 					switch v := p.(type) {
 					case float64:
@@ -1091,13 +1110,23 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 						port = v.String()
 					}
 				}
-				sni, _ = vmap["sni"].(string)
-				if sni == "" {
-					sni, _ = vmap["host"].(string)
+				if s, ok := vmap["sni"].(string); ok {
+					sni = s
 				}
-				path, _ = vmap["path"].(string)
-				transport, _ = vmap["net"].(string)
-				security, _ = vmap["tls"].(string)
+				if sni == "" {
+					if h, ok := vmap["host"].(string); ok {
+						sni = h
+					}
+				}
+				if pth, ok := vmap["path"].(string); ok {
+					path = pth
+				}
+				if n, ok := vmap["net"].(string); ok {
+					transport = n
+				}
+				if t, ok := vmap["tls"].(string); ok {
+					security = t
+				}
 				return host, port, sni, path, strings.ToLower(transport), "vmess", security, ""
 			}
 		}
