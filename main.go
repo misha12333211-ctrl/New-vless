@@ -5,7 +5,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
-	"container/heap"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,37 +27,19 @@ import (
 	"time"
 )
 
-// === КОНФИГУРАЦИОННЫЕ КОНСТАНТЫ (Подстроены под GitHub Actions Runner: 2 vCPU, 7GB RAM) ===
 const (
-	maxOutputLimit        = 300
-	workerConcurrency     = 16               // Оптимальное количество воркеров под 2 CPU
-	fetchConcurrency      = 8                // Параллельное скачивание источников
-	tcpTimeout            = 800 * time.Millisecond
-	serviceTimeout        = 2500 * time.Millisecond
-	dnsTTL                = 15 * time.Minute
-	geoCacheMaxEntries    = 5000
-	maxSubscriptionMemory = 8 * 1024 * 1024  // Ограничение размера 1 подписки: 8MB
+	maxConcurrency   = 64 // Увеличено благодаря stdin/no-disk-io
+	maxOutputLimit   = 300
+	pingTimeout      = 1000 * time.Millisecond
+	serviceTimeout   = 4500 * time.Millisecond
+	fetchConcurrency = 20
+	baseSocksPort    = 20000
 )
 
-// Mетрики работы программы
-type ExecutionMetrics struct {
-	SourcesCount      int64
-	FetchedConfigs    int64
-	UniqueConfigs     int64
-	Stage1Passed      int64
-	TCPPassed         int64
-	ProxyTested       int64
-	ValidResults      int64
-	DNSCacheHits      int64
-	GeoIPCacheHits    int64
-}
-
-var metrics ExecutionMetrics
-
-// Структура результата
 type ConfigResult struct {
 	URL            string
 	Latency        time.Duration
+	AdjustedPing   time.Duration
 	Score          int
 	ServiceSuccess int
 	SNI            string
@@ -67,80 +50,6 @@ type ConfigResult struct {
 	HasBypassTech  bool
 }
 
-// Bounded Priority Queue (Min-Heap для сохранения Top-N лучших результатов без полной сортировки)
-type PriorityQueue []*ConfigResult
-
-func (pq PriorityQueue) Len() int           { return len(pq) }
-func (pq PriorityQueue) Less(i, j int) bool {
-	if pq[i].ServiceSuccess == pq[j].ServiceSuccess {
-		if pq[i].Score == pq[j].Score {
-			return pq[i].Latency > pq[j].Latency // Храним наихудший сверху для быстрого выталкивания
-		}
-		return pq[i].Score < pq[j].Score
-	}
-	return pq[i].ServiceSuccess < pq[j].ServiceSuccess
-}
-func (pq PriorityQueue) Swap(i, j int) {
-	pq[i], pq[j] = pq[j], pq[i]
-}
-func (pq *PriorityQueue) Push(x interface{}) {
-	*pq = append(*pq, x.(*ConfigResult))
-}
-func (pq *PriorityQueue) Pop() interface{} {
-	old := *pq
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = nil
-	*pq = old[0 : n-1]
-	return item
-}
-
-type SafeTopNHeap struct {
-	mu sync.Mutex
-	pq PriorityQueue
-}
-
-func NewSafeTopNHeap(capacity int) *SafeTopNHeap {
-	h := &SafeTopNHeap{pq: make(PriorityQueue, 0, capacity)}
-	heap.Init(&h.pq)
-	return h
-}
-
-func (h *SafeTopNHeap) Push(res *ConfigResult) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.pq.Len() < maxOutputLimit {
-		heap.Push(&h.pq, res)
-	} else if h.isBetter(res, h.pq[0]) {
-		heap.Pop(&h.pq)
-		heap.Push(&h.pq, res)
-	}
-}
-
-func (h *SafeTopNHeap) isBetter(a, b *ConfigResult) bool {
-	if a.ServiceSuccess != b.ServiceSuccess {
-		return a.ServiceSuccess > b.ServiceSuccess
-	}
-	if a.Score != b.Score {
-		return a.Score > b.Score
-	}
-	return a.Latency < b.Latency
-}
-
-func (h *SafeTopNHeap) ToSortedSlice() []ConfigResult {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	size := h.pq.Len()
-	result := make([]ConfigResult, size)
-	for i := size - 1; i >= 0; i-- {
-		result[i] = *(heap.Pop(&h.pq).(*ConfigResult))
-	}
-	return result
-}
-
-// Target Services
 type TargetService struct {
 	Name           string
 	URL            string
@@ -169,11 +78,6 @@ var targetServices = []TargetService{
 		ExpectedStatus: func(c int) bool { return c == 200 },
 	},
 	{
-		Name:           "Instagram",
-		URL:            "https://www.instagram.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 301 || c == 302 },
-	},
-	{
 		Name:           "WhatsApp",
 		URL:            "https://web.whatsapp.com",
 		ExpectedStatus: func(c int) bool { return c == 200 || c == 302 },
@@ -181,7 +85,7 @@ var targetServices = []TargetService{
 	{
 		Name:           "ChatGPT",
 		URL:            "https://chatgpt.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 307 || c == 403 },
+		ExpectedStatus: func(c int) bool { return c == 200 || c == 307 },
 	},
 }
 
@@ -202,125 +106,53 @@ var nearRUCountries = map[string]bool{
 	"UZ": true, "AZ": true, "KG": true, "TJ": true, "TR": true, "AT": true,
 }
 
-// Cache structures with TTL
-type dnsCacheEntry struct {
-	ip        string
-	expiresAt time.Time
-}
+var (
+	portCounter uint32 = 0
+	sharedHTTPClient *http.Client
+)
 
-type FastDNSCache struct {
-	mu    sync.RWMutex
-	items map[string]dnsCacheEntry
-}
-
-var dnsCache = &FastDNSCache{items: make(map[string]dnsCacheEntry)}
-
-func (d *FastDNSCache) Get(host string) (string, bool) {
-	d.mu.RLock()
-	entry, ok := d.items[host]
-	d.mu.RUnlock()
-
-	if ok && time.Now().Before(entry.expiresAt) {
-		atomic.AddInt64(&metrics.DNSCacheHits, 1)
-		return entry.ip, true
+func init() {
+	tr := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       15 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		DisableKeepAlives:     false,
 	}
-	return "", false
-}
-
-func (d *FastDNSCache) Set(host, ip string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.items[host] = dnsCacheEntry{
-		ip:        ip,
-		expiresAt: time.Now().Add(dnsTTL),
+	sharedHTTPClient = &http.Client{
+		Timeout:   8 * time.Second,
+		Transport: tr,
 	}
 }
 
-type SimpleGeoCache struct {
-	mu    sync.RWMutex
-	items map[string]string
+func getNextPort() int {
+	val := atomic.AddUint32(&portCounter, 1)
+	return int(baseSocksPort + (val % 10000))
 }
 
-var geoCache = &SimpleGeoCache{items: make(map[string]string)}
-
-func (c *SimpleGeoCache) Get(key string) (string, bool) {
-	c.mu.RLock()
-	val, ok := c.items[key]
-	c.mu.RUnlock()
-	if ok {
-		atomic.AddInt64(&metrics.GeoIPCacheHits, 1)
-	}
-	return val, ok
-}
-
-func (c *SimpleGeoCache) Set(key, value string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.items) >= geoCacheMaxEntries {
-		// Очистка 20% старых записей вместо половинного сброса
-		count := 0
-		for k := range c.items {
-			delete(c.items, k)
-			count++
-			if count >= geoCacheMaxEntries/5 {
-				break
-			}
-		}
-	}
-	c.items[key] = value
-}
-
-var globalResolver = &net.Resolver{
-	PreferGo: true,
-	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-		d := net.Dialer{Timeout: 1200 * time.Millisecond}
-		conn, err := d.DialContext(ctx, "udp", "1.1.1.1:53")
-		if err != nil {
-			return d.DialContext(ctx, "udp", "8.8.8.8:53")
-		}
-		return conn, nil
-	},
-}
-
-// === MAIN ENTRYPOINT ===
 func main() {
 	startTime := time.Now()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
-	fmt.Println("=== [1/5] Инициализация среды и ядра sing-box ===")
-	if err := ensureCoreAvailable(ctx); err != nil {
-		fmt.Printf("Ошибка подготовки sing-box core: %v\n", err)
+	fmt.Println("=== [1/5] Инициализация ядра sing-box ===")
+	corePath := ensureCoreAvailable()
+	if corePath == "" {
+		fmt.Println("Ошибка: не удалось найти или скачать sing-box core.")
+		return
 	}
 
 	sources, err := readLines("sources.txt")
 	if err != nil || len(sources) == 0 {
-		fmt.Printf("Внимание: sources.txt не найден или пуст: %v. Создаем пустые выходы.\n", err)
-		_ = safeWriteFile("output_raw.txt", []byte(""))
-		_ = safeWriteFile("output_base64.txt", []byte(""))
+		fmt.Printf("Внимание: sources.txt не найден или пуст: %v. Завершение.\n", err)
+		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
+		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
-	atomic.StoreInt64(&metrics.SourcesCount, int64(len(sources)))
-	fmt.Printf("Успешно загружено источников: %d\n", len(sources))
+	fmt.Printf("Загружено источников: %d\n", len(sources))
 
-	fmt.Println("=== [2/5] Сбор, потоковая фильтрация и Base64 декодирование ===")
-	
-	rawConfigs := make(chan string, 2000)
-	tr := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       20 * time.Second,
-		ResponseHeaderTimeout: 8 * time.Second,
-		DisableKeepAlives:     false,
-	}
-
-	sharedHTTPClient := &http.Client{
-		Timeout:   12 * time.Second,
-		Transport: tr,
-	}
-
-	var fetchWg sync.WaitGroup
+	fmt.Println("=== [2/5] Параллельный сбор и дедупликация ===")
+	rawConfigs := make(chan string, 300000)
+	var wg sync.WaitGroup
 	fetchSem := make(chan struct{}, fetchConcurrency)
 
 	for _, src := range sources {
@@ -328,175 +160,149 @@ func main() {
 		if src == "" || strings.HasPrefix(src, "#") || strings.HasPrefix(src, "//") {
 			continue
 		}
-		fetchWg.Add(1)
+		wg.Add(1)
 		go func(targetURL string) {
-			defer fetchWg.Done()
+			defer wg.Done()
 			fetchSem <- struct{}{}
 			defer func() { <-fetchSem }()
-			fetchSubscriptionWithClient(ctx, sharedHTTPClient, targetURL, rawConfigs)
+			fetchSubscriptionWithClient(sharedHTTPClient, targetURL, rawConfigs)
 		}(src)
 	}
 
-	go func() {
-		fetchWg.Wait()
-		close(rawConfigs)
-		tr.CloseIdleConnections()
-	}()
+	wg.Wait()
+	close(rawConfigs)
 
-	uniqueConfigs := make(map[string]struct{})
+	uniqueConfigs := make(map[string]bool)
 	for cfg := range rawConfigs {
 		cfg = sanitizeProxyURL(cfg)
-		if cfg != "" && len(cfg) < 4096 && isProxyProtocol(cfg) {
-			uniqueConfigs[cfg] = struct{}{}
+		if cfg != "" && len(cfg) < 8192 && isProxyProtocol(cfg) {
+			uniqueConfigs[cfg] = true
 		}
 	}
 
 	totalConfigs := len(uniqueConfigs)
-	atomic.StoreInt64(&metrics.UniqueConfigs, int64(totalConfigs))
-	fmt.Printf("Валидных уникальных прокси-ссылок в базе: %d\n", totalConfigs)
+	fmt.Printf("Уникальных прокси-ссылок найдено: %d\n", totalConfigs)
 
 	if totalConfigs == 0 {
-		fmt.Println("Нет валидных конфигураций для тестирования. Завершение работы.")
-		_ = safeWriteFile("output_raw.txt", []byte(""))
-		_ = safeWriteFile("output_base64.txt", []byte(""))
+		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
+		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
 		return
 	}
 
-	fmt.Println("=== [3/5] Оптимизированный аудит ТСПУ + Многоэтапное тестирование ===")
-
-	topHeap := NewSafeTopNHeap(maxOutputLimit)
-	configChan := make(chan string, 1000)
-
-	go func() {
-		for cfg := range uniqueConfigs {
-			configChan <- cfg
-		}
-		close(configChan)
-	}()
-
+	fmt.Println("=== [3/5] Высокоскоростное тестирование через In-Memory Stdin ===")
+	resultsChan := make(chan ConfigResult, totalConfigs)
+	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
 	var processedCount int64
 
-	for i := 0; i < workerConcurrency; i++ {
+	for cfg := range uniqueConfigs {
 		testWg.Add(1)
-		go func() {
+		go func(c string) {
 			defer testWg.Done()
-			for cfg := range configChan {
-				if res, ok := testConfig(ctx, cfg); ok {
-					topHeap.Push(&res)
-					atomic.AddInt64(&metrics.ValidResults, 1)
-				}
-				curr := atomic.AddInt64(&processedCount, 1)
-				if curr%250 == 0 || curr == int64(totalConfigs) {
-					fmt.Printf("Обработано конфигураций: %d / %d\r", curr, totalConfigs)
-				}
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			if res, ok := testConfig(corePath, c); ok {
+				resultsChan <- res
 			}
-		}()
+
+			curr := atomic.AddInt64(&processedCount, 1)
+			if curr%250 == 0 || curr == int64(totalConfigs) {
+				fmt.Printf("Обработано: %d / %d\r", curr, totalConfigs)
+			}
+		}(cfg)
 	}
 
 	testWg.Wait()
-	fmt.Println("\nТестирование полностью завершено.")
+	close(resultsChan)
+	fmt.Println("\nТестирование успешно завершено.")
 
-	selected := topHeap.ToSortedSlice()
-	fmt.Printf("=== [4/5] Ранжирование и формирование подписки (Отобрано Top-%d) ===\n", len(selected))
+	var validResults []ConfigResult
+	for res := range resultsChan {
+		if res.Score > 0 && res.ServiceSuccess >= 1 {
+			validResults = append(validResults, res)
+		}
+	}
+
+	fmt.Printf("=== [4/5] Ранжирование под РФ (Успешных: %d) ===\n", len(validResults))
+
+	sort.Slice(validResults, func(i, j int) bool {
+		if validResults[i].ServiceSuccess == validResults[j].ServiceSuccess {
+			if validResults[i].Score == validResults[j].Score {
+				return validResults[i].AdjustedPing < validResults[j].AdjustedPing
+			}
+			return validResults[i].Score > validResults[j].Score
+		}
+		return validResults[i].ServiceSuccess > validResults[j].ServiceSuccess
+	})
+
+	var selected []ConfigResult
+	usedMap := make(map[string]bool)
+
+	for _, res := range validResults {
+		if len(selected) >= maxOutputLimit {
+			break
+		}
+		if !usedMap[res.URL] {
+			selected = append(selected, res)
+			usedMap[res.URL] = true
+		}
+	}
 
 	var finalSlice []string
 	for i, r := range selected {
-		displayName := fmt.Sprintf("MiGiTi #%d | TG: MiGiTi_official_channel", i+1)
+		displayName := fmt.Sprintf("By MiGiTi SNI #%d", i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-	serverCount := len(finalSlice)
-	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", serverCount)
+	fmt.Printf("Сформировано конфигов в подписке: %d шт.\n", len(finalSlice))
 
-	fmt.Println("=== [5/5] Запись результативных файлов ===")
-
-	mskLoc := time.FixedZone("MSK", 3*3600)
-	updateTimeStr := time.Now().In(mskLoc).Format("2006-01-02 15:04:05")
-
-	subscriptionHeader := fmt.Sprintf("//profile-title: MIGITI Subscriptions\n"+
-		"//profile-update-interval: 1\n"+
-		"//subscription-userinfo: upload=0; download=0; total=1073741824000; expire=0\n"+
-		"//total-nodes: %d\n"+
-		"//updated-at: %s MSK\n"+
-		"//channel: https://t.me/MiGiTi_official_channel\n"+
-		"//chat: https://t.me/MiGiTi_official_chat\n"+
-		"//forum: https://t.me/MiGiTi_FORUM\n"+
-		"//site: https://misha12333211-ctrl.github.io/MiGiTi/\n"+
-		"//profile-web-page-url: https://github.com/misha12333211-ctrl/proxy-subs\n\n",
-		serverCount, updateTimeStr)
-
+	fmt.Println("=== [5/5] Сохранение результатов ===")
+	subscriptionHeader := "//profile-title: Go Engine By MiGiTi Optimized\n"
 	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
-	if err := safeWriteFile("output_raw.txt", []byte(rawOutput)); err != nil {
-		fmt.Printf("Ошибка записи output_raw.txt: %v\n", err)
-	}
+	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
-	if err := safeWriteFile("output_base64.txt", []byte(b64Output)); err != nil {
-		fmt.Printf("Ошибка записи output_base64.txt: %v\n", err)
-	}
+	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
 
-	fmt.Println("\n=== Сводка выполнения / Metrics ===")
-	fmt.Printf("Источников: %d | Конфигов получено: %d | Уникальных: %d\n", metrics.SourcesCount, metrics.FetchedConfigs, metrics.UniqueConfigs)
-	fmt.Printf("Stage 1 (Фильтр) пройдено: %d | TCP Ping пройдено: %d | Proxy проверено: %d\n", metrics.Stage1Passed, metrics.TCPPassed, metrics.ProxyTested)
-	fmt.Printf("DNS Cache Hits: %d | GeoIP Cache Hits: %d\n", metrics.DNSCacheHits, metrics.GeoIPCacheHits)
-	fmt.Printf("Итоговое время выполнения: %v!\n", time.Since(startTime))
+	fmt.Printf("Готово за %v!\n", time.Since(startTime))
 }
 
-func safeWriteFile(filename string, data []byte) error {
-	tmpFile := filename + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpFile, filename)
-}
-
-// === MULTI-STAGE PIPELINE (Многоэтапное тестирование) ===
-func testConfig(ctx context.Context, configStr string) (ConfigResult, bool) {
-	// STAGE 1: Быстрая синтаксическая валидация
-	host, port, sni, transport, proto, security, flow := parseConfigDetails(configStr)
+func testConfig(corePath, configStr string) (ConfigResult, bool) {
+	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
 	if host == "" || port == "" {
 		return ConfigResult{}, false
 	}
 
+	ruSNI := isRuSNI(sni)
+	hasBypassTech := security == "reality" || proto == "hysteria2" || proto == "hy2" || proto == "tuic" || flow != "" || strings.Contains(configStr, "fp=")
+
 	if !passTSPUBypassFilter(proto, port, sni, security, configStr) {
 		return ConfigResult{}, false
 	}
-	atomic.AddInt64(&metrics.Stage1Passed, 1)
 
-	// STAGE 2: Быстрый TCP Ping без тяжелых процессов
-	realPing, resolvedIP, ok := measureTCPPingWithDNS(ctx, host, port)
-	if !ok || realPing > tcpTimeout {
+	realPing, ok := measureTCPPing(host, port)
+	if !ok || realPing > pingTimeout {
 		return ConfigResult{}, false
 	}
-	atomic.AddInt64(&metrics.TCPPassed, 1)
 
-	// STAGE 3: Комплексная проверка через sing-box
-	atomic.AddInt64(&metrics.ProxyTested, 1)
-	passedServices, ok := checkTargetServicesViaProxy(ctx, configStr)
+	passedServices, ok := checkTargetServicesViaProxy(corePath, configStr)
 	if !ok || passedServices < 1 {
 		return ConfigResult{}, false
 	}
 
-	// STAGE 4: Определение геолокации и скоринг
-	ruSNI := isRuSNI(sni)
-	hasBypassTech := security == "reality" || proto == "hysteria2" || proto == "hy2" || proto == "tuic" || flow != "" || strings.Contains(configStr, "fp=")
-
-	countryCode := getIPCountryCode(ctx, resolvedIP)
-	isNearRU := nearRUCountries[countryCode]
-
-	score := calculateBypassScore(configStr, port, sni, transport, realPing, passedServices, isNearRU, countryCode, ruSNI, hasBypassTech)
+	adjustedPing := realPing
+	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, false, "", ruSNI, hasBypassTech)
 
 	return ConfigResult{
 		URL:            configStr,
 		Latency:        realPing,
+		AdjustedPing:   adjustedPing,
 		Score:          score,
 		ServiceSuccess: passedServices,
 		SNI:            sni,
 		Protocol:       proto,
-		CountryCode:    countryCode,
-		IsNearRU:       isNearRU,
 		IsRuSNI:        ruSNI,
 		HasBypassTech:  hasBypassTech,
 	}, true
@@ -517,65 +323,33 @@ func passTSPUBypassFilter(proto, port, sni, security, fullURL string) bool {
 	return true
 }
 
-func measureTCPPingWithDNS(ctx context.Context, host string, port string) (time.Duration, string, bool) {
-	ipStr := host
-	if net.ParseIP(host) == nil {
-		if cachedIP, found := dnsCache.Get(host); found {
-			ipStr = cachedIP
-		} else {
-			reqCtx, cancel := context.WithTimeout(ctx, 1000*time.Millisecond)
-			ips, err := globalResolver.LookupHost(reqCtx, host)
-			cancel()
-			if err != nil || len(ips) == 0 {
-				return 0, "", false
-			}
-			ipStr = ips[0]
-			dnsCache.Set(host, ipStr)
-		}
-	}
-
-	address := net.JoinHostPort(ipStr, port)
+func measureTCPPing(host string, port string) (time.Duration, bool) {
+	address := net.JoinHostPort(host, port)
 	start := time.Now()
 
-	d := net.Dialer{Timeout: tcpTimeout}
-	conn, err := d.DialContext(ctx, "tcp", address)
+	d := net.Dialer{Timeout: pingTimeout}
+	conn, err := d.Dial("tcp", address)
 	if err != nil {
-		return 0, "", false
+		return 0, false
 	}
 	_ = conn.Close()
-	return time.Since(start), ipStr, true
+	return time.Since(start), true
 }
 
-func checkTargetServicesViaProxy(parentCtx context.Context, configStr string) (int, bool) {
-	corePath := findCoreExecutable()
-	if corePath == "" {
-		return 0, false
-	}
-
-	socksPort, err := getFreePortNumber()
-	if err != nil {
-		return 0, false
-	}
+func checkTargetServicesViaProxy(corePath, configStr string) (int, bool) {
+	socksPort := getNextPort()
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
 	if err != nil {
 		return 0, false
 	}
 
-	tmpConfigFile, err := os.CreateTemp("", "sb_cfg_*.json")
-	if err != nil {
-		return 0, false
-	}
-	tmpConfigPath := tmpConfigFile.Name()
-	_, _ = tmpConfigFile.Write(singBoxConfigJSON)
-	_ = tmpConfigFile.Close()
-
-	defer os.Remove(tmpConfigPath)
-
-	ctx, cancel := context.WithTimeout(parentCtx, serviceTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, corePath, "run", "-c", tmpConfigPath)
+	// Запуск sing-box через Stdin без записи файлов на диск!
+	cmd := exec.CommandContext(ctx, corePath, "run", "-c", "stdin:")
+	cmd.Stdin = bytes.NewReader(singBoxConfigJSON)
 
 	if err := cmd.Start(); err != nil {
 		return 0, false
@@ -590,8 +364,8 @@ func checkTargetServicesViaProxy(parentCtx context.Context, configStr string) (i
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 25; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
+	for i := 0; i < 20; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 15*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
@@ -609,45 +383,30 @@ func checkTargetServicesViaProxy(parentCtx context.Context, configStr string) (i
 		Proxy:               http.ProxyURL(proxyURL),
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: 1200 * time.Millisecond,
-		ForceAttemptHTTP2:   false,
+		TLSHandshakeTimeout: 1500 * time.Millisecond,
 	}
 	defer httpTransport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   1500 * time.Millisecond,
+		Timeout:   1800 * time.Millisecond,
 	}
 
-	// Ранний выход (Early Exit Stage): сначала проверяем только Google (быстрая планка качества)
-	fastReq, err := http.NewRequestWithContext(ctx, "GET", targetServices[0].URL, nil)
-	if err != nil {
-		return 0, false
-	}
-	fastReq.Header.Set("User-Agent", "Mozilla/5.0 Chrome/128.0.0.0")
-	resp, err := client.Do(fastReq)
-	if err != nil || !targetServices[0].ExpectedStatus(resp.StatusCode) {
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
-		return 0, false
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
-	_ = resp.Body.Close()
-
-	// Если базовый узел прошел Stage 1, проверяем остальной набор параллельно
 	var wg sync.WaitGroup
-	var successCount int64 = 1 // Google уже успешен
+	var successCount int64
 
-	for _, service := range targetServices[1:] {
+	for _, service := range targetServices {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			req, err := http.NewRequestWithContext(ctx, "GET", s.URL, nil)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 1600*time.Millisecond)
+			defer reqCancel()
+
+			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
 			if err != nil {
 				return
 			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/128.0.0.0")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
 			resp, err := client.Do(req)
 			if err != nil {
@@ -664,17 +423,7 @@ func checkTargetServicesViaProxy(parentCtx context.Context, configStr string) (i
 
 	wg.Wait()
 	totalSuccess := int(atomic.LoadInt64(&successCount))
-	return totalSuccess, true
-}
-
-func getFreePortNumber() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port, nil
+	return totalSuccess, totalSuccess > 0
 }
 
 func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
@@ -828,12 +577,6 @@ func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 		outbound["type"] = "hysteria2"
 		outbound["password"] = uuid
 		outbound["tls"] = tlsConfig
-		if obfs := query.Get("obfs"); obfs != "" {
-			outbound["obfs"] = map[string]interface{}{
-				"type":     obfs,
-				"password": query.Get("obfs-password"),
-			}
-		}
 
 	case "tuic":
 		outbound["type"] = "tuic"
@@ -868,7 +611,7 @@ func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
 	return json.Marshal(config)
 }
 
-func findCoreExecutable() string {
+func ensureCoreAvailable() string {
 	if path, err := exec.LookPath("sing-box"); err == nil {
 		return path
 	}
@@ -883,170 +626,84 @@ func findCoreExecutable() string {
 			return local
 		}
 	}
-	return ""
-}
 
-func ensureCoreAvailable(ctx context.Context) error {
-	if findCoreExecutable() != "" {
-		return nil
-	}
-
-	fmt.Println("Автоматическая установка sing-box Core...")
-	var downloadURL string
 	version := "1.8.11"
-
+	var downloadURL string
 	switch runtime.GOOS {
 	case "linux":
 		if runtime.GOARCH == "amd64" {
 			downloadURL = fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz", version, version)
-		} else if runtime.GOARCH == "arm64" {
-			downloadURL = fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-arm64.tar.gz", version, version)
 		}
 	case "windows":
 		downloadURL = fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-windows-amd64.zip", version, version)
 	}
 
 	if downloadURL == "" {
-		return fmt.Errorf("unsupported OS/arch: %s/%s", runtime.GOOS, runtime.GOARCH)
+		return ""
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
-	if err != nil {
-		return err
-	}
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Get(downloadURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
-		return fmt.Errorf("download failed: %v", err)
+		return ""
 	}
 	defer resp.Body.Close()
 
-	cwd, _ := os.Getwd()
+	cwd, _ = os.Getwd()
 	targetExe := "sing-box"
 	if runtime.GOOS == "windows" {
 		targetExe = "sing-box.exe"
 	}
-
 	outPath := filepath.Join(cwd, targetExe)
 
-	if strings.HasSuffix(downloadURL, ".zip") {
-		tmpZip, err := os.CreateTemp("", "sb_download_*.zip")
-		if err != nil {
-			return err
-		}
-		defer os.Remove(tmpZip.Name())
-
-		if _, err := io.Copy(tmpZip, resp.Body); err != nil {
-			_ = tmpZip.Close()
-			return err
-		}
-		_ = tmpZip.Close()
-
-		r, err := zip.OpenReader(tmpZip.Name())
-		if err != nil {
-			return err
-		}
-		defer r.Close()
-
-		for _, f := range r.File {
-			cleanName := filepath.Base(filepath.Clean(f.Name))
-			if cleanName == targetExe {
-				rc, err := f.Open()
-				if err != nil {
-					return err
-				}
-
-				tmpOut, err := os.CreateTemp(cwd, "singbox_tmp_*")
-				if err != nil {
-					_ = rc.Close()
-					return err
-				}
-
-				_, err = io.Copy(tmpOut, rc)
-				_ = rc.Close()
-				_ = tmpOut.Close()
-				if err != nil {
-					_ = os.Remove(tmpOut.Name())
-					return err
-				}
-
-				_ = os.Chmod(tmpOut.Name(), 0755)
-				if err := os.Rename(tmpOut.Name(), outPath); err != nil {
-					_ = os.Remove(tmpOut.Name())
-					return err
-				}
-				fmt.Printf("sing-box Core успешно развернут: (%s)\n", outPath)
-				return nil
-			}
-		}
-	} else if strings.HasSuffix(downloadURL, ".tar.gz") {
+	if strings.HasSuffix(downloadURL, ".tar.gz") {
 		gzr, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return err
+			return ""
 		}
 		defer gzr.Close()
 
 		tr := tar.NewReader(gzr)
 		for {
 			header, err := tr.Next()
-			if err == io.EOF {
+			if err != nil {
 				break
 			}
-			if err != nil {
-				return err
-			}
-			cleanName := filepath.Base(filepath.Clean(header.Name))
-			if cleanName == targetExe {
-				tmpOut, err := os.CreateTemp(cwd, "singbox_tmp_*")
+			if filepath.Base(header.Name) == targetExe {
+				outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 				if err != nil {
-					return err
+					return ""
 				}
-
-				if _, err := io.Copy(tmpOut, tr); err != nil {
-					_ = tmpOut.Close()
-					_ = os.Remove(tmpOut.Name())
-					return err
-				}
-				_ = tmpOut.Close()
-
-				_ = os.Chmod(tmpOut.Name(), 0755)
-				if err := os.Rename(tmpOut.Name(), outPath); err != nil {
-					_ = os.Remove(tmpOut.Name())
-					return err
-				}
-				fmt.Printf("sing-box Core успешно развернут: (%s)\n", outPath)
-				return nil
+				_, _ = io.Copy(outFile, tr)
+				_ = outFile.Close()
+				return outPath
 			}
 		}
 	}
-	return fmt.Errorf("core binary not found in downloaded archive")
+
+	return ""
 }
 
-func fetchSubscriptionWithClient(ctx context.Context, client *http.Client, targetURL string, out chan<- string) {
-	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan<- string) {
+	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/128.0.0.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256*1024))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 			_ = resp.Body.Close()
 		}
 		return
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256*1024))
-		_ = resp.Body.Close()
-	}()
+	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionMemory))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
 		return
 	}
@@ -1058,9 +715,6 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 	content = strings.TrimSpace(content)
 
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, maxSubscriptionMemory)
-
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -1068,7 +722,6 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 		}
 
 		if isProxyProtocol(line) {
-			atomic.AddInt64(&metrics.FetchedConfigs, 1)
 			out <- line
 			continue
 		}
@@ -1080,7 +733,6 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 				for subScanner.Scan() {
 					subLine := strings.TrimSpace(subScanner.Text())
 					if isProxyProtocol(subLine) {
-						atomic.AddInt64(&metrics.FetchedConfigs, 1)
 						out <- subLine
 					}
 				}
@@ -1137,49 +789,8 @@ func isProxyProtocol(line string) bool {
 		strings.HasPrefix(lower, "tuic://")
 }
 
-func getIPCountryCode(ctx context.Context, ipStr string) string {
-	if ipStr == "" {
-		return ""
-	}
-
-	if val, ok := geoCache.Get(ipStr); ok {
-		return val
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, "GET", "https://freeipapi.com/api/json/"+ipStr, nil)
-	if err != nil {
-		return ""
-	}
-
-	client := &http.Client{Timeout: 800 * time.Millisecond}
-	resp, err := client.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-
-	var res struct {
-		CountryCode string `json:"countryCode"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.CountryCode != "" {
-		geoCache.Set(ipStr, res.CountryCode)
-		return res.CountryCode
-	}
-	return ""
-}
-
-// Скоринг без искусственного искажения latency
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string, ruSNI bool, hasBypassTech bool) int {
 	score := 100 + (passedServices * 500)
-
-	if countryCode == "RU" {
-		score += 2500
-	} else if isNearRU {
-		score += 1200
-	}
 
 	if ruSNI {
 		score += 2000
@@ -1220,99 +831,16 @@ func setConfigNameUniversal(configURL string, name string) string {
 	escapedName := url.PathEscape(name)
 	escapedName = strings.ReplaceAll(escapedName, "#", "%23")
 
-	if strings.HasPrefix(configURL, "vmess://") && len(configURL) > 8 {
-		b64 := configURL[8:]
-		if idx := strings.Index(b64, "#"); idx != -1 {
-			b64 = b64[:idx]
-		}
-		decoded, err := decodeBase64Flex(b64)
-		if err == nil {
-			var vmap map[string]interface{}
-			if err := json.Unmarshal(decoded, &vmap); err == nil && vmap != nil {
-				vmap["ps"] = name
-				if newJSON, err := json.Marshal(vmap); err == nil {
-					return "vmess://" + base64.StdEncoding.EncodeToString(newJSON)
-				}
-			}
-		}
-	}
-
 	if idx := strings.Index(configURL, "#"); idx != -1 {
 		return configURL[:idx] + "#" + escapedName
 	}
 	return configURL + "#" + escapedName
 }
 
-func parseConfigDetails(configStr string) (host string, port string, sni string, transport string, proto string, security string, flow string) {
-	if strings.HasPrefix(configStr, "ss://") && len(configStr) > 5 {
-		u, err := url.Parse(configStr)
-		if err == nil && u.Hostname() != "" {
-			host = u.Hostname()
-			port = u.Port()
-			query := u.Query()
-			sni = query.Get("sni")
-			if sni == "" {
-				sni = query.Get("plugin")
-			}
-			return host, port, sni, "", "ss", "none", ""
-		}
-
-		raw := configStr[5:]
-		if idx := strings.Index(raw, "#"); idx != -1 {
-			raw = raw[:idx]
-		}
-		if idx := strings.Index(raw, "@"); idx != -1 {
-			hostPort := raw[idx+1:]
-			if hpHost, hpPort, err := net.SplitHostPort(hostPort); err == nil {
-				return hpHost, hpPort, "", "", "ss", "none", ""
-			}
-		} else {
-			if decoded, err := decodeBase64Flex(raw); err == nil {
-				decStr := string(decoded)
-				if idx := strings.Index(decStr, "@"); idx != -1 {
-					hostPort := decStr[idx+1:]
-					if hpHost, hpPort, err := net.SplitHostPort(hostPort); err == nil {
-						return hpHost, hpPort, "", "", "ss", "none", ""
-					}
-				}
-			}
-		}
-	}
-
-	if strings.HasPrefix(configStr, "vmess://") && len(configStr) > 8 {
-		b64 := configStr[8:]
-		if idx := strings.Index(b64, "#"); idx != -1 {
-			b64 = b64[:idx]
-		}
-		decoded, err := decodeBase64Flex(b64)
-		if err == nil {
-			var vmap map[string]interface{}
-			if err := json.Unmarshal(decoded, &vmap); err == nil && vmap != nil {
-				host, _ = vmap["add"].(string)
-				if p, ok := vmap["port"]; ok {
-					switch v := p.(type) {
-					case float64:
-						port = strconv.Itoa(int(v))
-					case string:
-						port = v
-					case json.Number:
-						port = v.String()
-					}
-				}
-				sni, _ = vmap["sni"].(string)
-				if sni == "" {
-					sni, _ = vmap["host"].(string)
-				}
-				transport, _ = vmap["net"].(string)
-				security, _ = vmap["tls"].(string)
-				return host, port, sni, strings.ToLower(transport), "vmess", security, ""
-			}
-		}
-	}
-
+func parseConfigDetails(configStr string) (host string, port string, sni string, path string, transport string, proto string, security string, flow string) {
 	u, err := url.Parse(configStr)
 	if err != nil {
-		return "", "", "", "", "", "", ""
+		return "", "", "", "", "", "", "", ""
 	}
 
 	proto = strings.ToLower(u.Scheme)
@@ -1331,6 +859,10 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 	if sni == "" {
 		sni = query.Get("host")
 	}
+	path = query.Get("path")
+	if path == "" {
+		path = "/"
+	}
 
 	transport = strings.ToLower(query.Get("type"))
 	if transport == "" {
@@ -1348,7 +880,7 @@ func parseConfigDetails(configStr string) (host string, port string, sni string,
 			port = "8388"
 		}
 	}
-	return host, port, sni, transport, proto, security, flow
+	return host, port, sni, path, transport, proto, security, flow
 }
 
 func readLines(path string) ([]string, error) {
