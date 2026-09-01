@@ -30,11 +30,11 @@ import (
 )
 
 const (
-	maxConcurrency     = 200  // Снижено до 16 для предотвращения OOM и блокировок GitHub Runner
+	maxConcurrency     = 128 // Безопасно для GitHub Actions Runner (ускорение в 8 раз)
 	maxOutputLimit     = 300 // Лимит конфигов в итоговой подписке
-	pingTimeout        = 1000 * time.Millisecond
-	serviceTimeout     = 5000 * time.Millisecond
-	fetchConcurrency   = 8
+	pingTimeout        = 800 * time.Millisecond
+	serviceTimeout     = 3500 * time.Millisecond
+	fetchConcurrency   = 16
 	maxGeoCacheEntries = 10000
 )
 
@@ -46,6 +46,7 @@ type ConfigResult struct {
 	ServiceSuccess int
 	SNI            string
 	Protocol       string
+	Host           string
 	CountryCode    string
 	ISP            string
 	IP             string
@@ -112,7 +113,7 @@ var (
 	dnsResolver  = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 1000 * time.Millisecond}
+			d := net.Dialer{Timeout: 800 * time.Millisecond}
 			conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
 			if err != nil {
 				return d.DialContext(ctx, "udp", "1.1.1.1:53")
@@ -138,13 +139,13 @@ func main() {
 	fmt.Printf("Успешно загружено источников: %d\n", len(sources))
 
 	fmt.Println("=== [2/5] Сбор, фильтрация и Base64 декодирование ===")
-	rawConfigs := make(chan string, 100000)
+	rawConfigs := make(chan string, 200000)
 	var wg sync.WaitGroup
 
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       15 * time.Second,
 		ResponseHeaderTimeout: 8 * time.Second,
 		DisableKeepAlives:     true,
@@ -195,7 +196,7 @@ func main() {
 
 	debug.FreeOSMemory()
 
-	fmt.Println("=== [3/5] Оптимизированный аудит ТСПУ + Высокоскоростное тестирование ===")
+	fmt.Println("=== [3/5] Высокоскоростное тестирование доступности прокси ===")
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
@@ -208,12 +209,12 @@ func main() {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			if res, ok := testConfig(c); ok {
+			if res, ok := testConfigFast(c); ok {
 				resultsChan <- res
 			}
 
 			curr := atomic.AddInt64(&processedCount, 1)
-			if curr%200 == 0 || curr == int64(totalConfigs) {
+			if curr%500 == 0 || curr == int64(totalConfigs) {
 				fmt.Printf("Обработано конфигураций: %d / %d\r", curr, totalConfigs)
 			}
 		}(cfg)
@@ -221,19 +222,25 @@ func main() {
 
 	testWg.Wait()
 	close(resultsChan)
-	fmt.Println("\nТестирование полностью завершено.")
+	fmt.Println("\nТестирование доступности полностью завершено.")
 
-	var validResults []ConfigResult
-	protoStats := make(map[string]int)
-
+	var rawValidResults []ConfigResult
 	for res := range resultsChan {
-		if res.Score > 0 && res.ServiceSuccess >= 1 {
-			validResults = append(validResults, res)
-			protoStats[res.Protocol]++
+		if res.ServiceSuccess >= 1 {
+			rawValidResults = append(rawValidResults, res)
 		}
 	}
 
-	fmt.Printf("=== [4/5] Ранжирование и оптимизация под РФ (Прошло: %d) ===\n", len(validResults))
+	fmt.Printf("=== [4/5] GeoIP Обогащение и ранжирование под РФ (Прошло тест: %d) ===\n", len(rawValidResults))
+
+	// Параллельное обогащение GeoIP только для прошедших прокси
+	validResults := enrichWithGeoIPParallel(rawValidResults)
+	protoStats := make(map[string]int)
+
+	for _, res := range validResults {
+		protoStats[res.Protocol]++
+	}
+
 	for proto, count := range protoStats {
 		fmt.Printf("  • %s: %d шт.\n", strings.ToUpper(proto), count)
 	}
@@ -274,7 +281,6 @@ func main() {
 			ispStr = "Server"
 		}
 
-		// Формируем эстетичное наименование: 🇩🇪 DE | Hetzner | MiGiTi #1
 		displayName := fmt.Sprintf("%s %s | %s | MiGiTi #%d", flag, countryStr, ispStr, i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
@@ -310,7 +316,7 @@ func main() {
 	fmt.Printf("Задание успешно выполнено за %v!\n", time.Since(startTime))
 }
 
-func testConfig(configStr string) (ConfigResult, bool) {
+func testConfigFast(configStr string) (ConfigResult, bool) {
 	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
 	if host == "" || port == "" {
 		return ConfigResult{}, false
@@ -333,33 +339,55 @@ func testConfig(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	geoInfo := getGeoInfo(host)
-	isNearRU := nearRUCountries[geoInfo.CountryCode]
-
-	adjustedPing := realPing
-	if geoInfo.CountryCode == "RU" {
-		adjustedPing = time.Duration(float64(realPing) * 0.20)
-	} else if isNearRU {
-		adjustedPing = time.Duration(float64(realPing) * 0.50)
-	}
-
-	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, geoInfo.CountryCode, ruSNI, hasBypassTech)
-
 	return ConfigResult{
 		URL:            configStr,
 		Latency:        realPing,
-		AdjustedPing:   adjustedPing,
-		Score:          score,
-		ServiceSuccess: passedServices,
 		SNI:            sni,
 		Protocol:       proto,
-		CountryCode:    geoInfo.CountryCode,
-		ISP:            geoInfo.ISP,
-		IP:             geoInfo.IP,
-		IsNearRU:       isNearRU,
+		Host:           host,
+		ServiceSuccess: passedServices,
 		IsRuSNI:        ruSNI,
 		HasBypassTech:  hasBypassTech,
 	}, true
+}
+
+func enrichWithGeoIPParallel(results []ConfigResult) []ConfigResult {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 30) // Ограничиваем GeoIP запросы, чтобы не получить баны
+	enriched := make([]ConfigResult, len(results))
+
+	for i, res := range results {
+		wg.Add(1)
+		go func(idx int, r ConfigResult) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			geoInfo := getGeoInfo(r.Host)
+			isNearRU := nearRUCountries[geoInfo.CountryCode]
+
+			adjustedPing := r.Latency
+			if geoInfo.CountryCode == "RU" {
+				adjustedPing = time.Duration(float64(r.Latency) * 0.20)
+			} else if isNearRU {
+				adjustedPing = time.Duration(float64(r.Latency) * 0.50)
+			}
+
+			score := calculateBypassScore(r.URL, "", r.SNI, "", adjustedPing, r.ServiceSuccess, isNearRU, geoInfo.CountryCode, r.IsRuSNI, r.HasBypassTech)
+
+			r.CountryCode = geoInfo.CountryCode
+			r.ISP = geoInfo.ISP
+			r.IP = geoInfo.IP
+			r.IsNearRU = isNearRU
+			r.AdjustedPing = adjustedPing
+			r.Score = score
+
+			enriched[idx] = r
+		}(i, res)
+	}
+
+	wg.Wait()
+	return enriched
 }
 
 func passTSPUBypassFilter(proto, port, sni, security, fullURL string) bool {
@@ -421,9 +449,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		return 0, false
 	}
 	tmpConfigPath := tmpConfigFile.Name()
-	defer func() {
-		_ = os.Remove(tmpConfigPath)
-	}()
+	defer os.Remove(tmpConfigPath)
 
 	_, _ = tmpConfigFile.Write(singBoxConfigJSON)
 	_ = tmpConfigFile.Close()
@@ -454,14 +480,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	proxyReady := false
-	for i := 0; i < 20; i++ {
-		conn, err := net.DialTimeout("tcp", socksAddr, 20*time.Millisecond)
+	for i := 0; i < 25; i++ {
+		conn, err := net.DialTimeout("tcp", socksAddr, 5*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			proxyReady = true
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	if !proxyReady {
@@ -473,14 +499,14 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		Proxy:               http.ProxyURL(proxyURL),
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: 1500 * time.Millisecond,
+		TLSHandshakeTimeout: 1200 * time.Millisecond,
 		ForceAttemptHTTP2:   false,
 	}
 	defer httpTransport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: httpTransport,
-		Timeout:   1800 * time.Millisecond,
+		Timeout:   1500 * time.Millisecond,
 	}
 
 	var wg sync.WaitGroup
@@ -490,7 +516,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 		wg.Add(1)
 		go func(s TargetService) {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 1200*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, "GET", s.URL, nil)
@@ -503,7 +529,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 			if err != nil {
 				return
 			}
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16*1024))
 			_ = resp.Body.Close()
 
 			if s.ExpectedStatus(resp.StatusCode) {
@@ -950,7 +976,6 @@ func isProxyProtocol(line string) bool {
 		strings.HasPrefix(lower, "tuic://")
 }
 
-// Конвертация кода страны (ISO 3166-1 alpha-2) в Unicode-флаг Emoji
 func countryCodeToFlag(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if len(code) != 2 {
@@ -963,11 +988,10 @@ func countryCodeToFlag(code string) string {
 	return string([]rune{runes[0] + 0x1F1A5, runes[1] + 0x1F1A5})
 }
 
-// Полный GeoIP + ISP запрос
 func getGeoInfo(host string) GeoInfo {
 	ipStr := host
 	if net.ParseIP(host) == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer cancel()
 		ips, err := dnsResolver.LookupHost(ctx, host)
 		if err != nil || len(ips) == 0 {
@@ -984,9 +1008,8 @@ func getGeoInfo(host string) GeoInfo {
 		return GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
 	}
 
-	client := &http.Client{Timeout: 800 * time.Millisecond}
-	// Запрос к ip-api.com для получения кода страны и провайдера
-	resp, err := client.Get("http://ip-api.com/json/" + ipStr + "?fields=countryCode,isp,org,as")
+	client := &http.Client{Timeout: 700 * time.Millisecond}
+	resp, err := client.Get("http://ip-api.com/json/" + ipStr + "?fields=countryCode,isp,org")
 	if err != nil {
 		emptyInfo := GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
 		geoCache.Store(ipStr, emptyInfo)
@@ -1009,7 +1032,6 @@ func getGeoInfo(host string) GeoInfo {
 			ispName = "Server"
 		}
 
-		// Форматирование наименования ISP (очистка лишних слов и символов)
 		ispName = cleanISPName(ispName)
 
 		info := GeoInfo{
@@ -1034,7 +1056,6 @@ func cleanISPName(name string) string {
 	name = strings.ReplaceAll(name, "#", "")
 	words := strings.Fields(name)
 	if len(words) > 0 {
-		// Берём 1-2 главных слова для краткости
 		if len(words) >= 2 && len(words[0]) <= 3 {
 			return words[0] + " " + words[1]
 		}
