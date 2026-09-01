@@ -260,15 +260,33 @@ func main() {
 
 	var finalSlice []string
 	for i, r := range selected {
-		displayName := fmt.Sprintf("By MiGiTi SNI #%d", i+1)
+		displayName := fmt.Sprintf("MiGiTi #%d | TG: MiGiTi_official_channel", i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
 
-	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", len(finalSlice))
+	serverCount := len(finalSlice)
+	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", serverCount)
 
 	fmt.Println("=== [5/5] Запись результативных файлов ===")
-	subscriptionHeader := "//profile-title: Go Engine By MiGiTi\n"
+
+	// Время обновления в MSK (UTC+3)
+	mskLoc := time.FixedZone("MSK", 3*3600)
+	updateTimeStr := time.Now().In(mskLoc).Format("2006-01-02 15:04:05")
+
+	// Формирование полного служебного хедера подписки
+	subscriptionHeader := fmt.Sprintf("//profile-title: MIGITI Subscriptions\n"+
+		"//profile-update-interval: 1\n"+
+		"//subscription-userinfo: upload=0; download=0; total=1073741824000; expire=0\n"+
+		"//total-nodes: %d\n"+
+		"//updated-at: %s MSK\n"+
+		"//channel: https://t.me/MiGiTi_official_channel\n"+
+		"//chat: https://t.me/MiGiTi_official_chat\n"+
+		"//forum: https://t.me/MiGiTi_FORUM\n"+
+		"//site: https://misha12333211-ctrl.github.io/MiGiTi/\n"+
+		"//profile-web-page-url: https://github.com/misha12333211-ctrl/proxy-subs\n\n",
+		serverCount, updateTimeStr)
+
 	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
 
@@ -346,7 +364,7 @@ func passTSPUBypassFilter(proto, port, sni, security, fullURL string) bool {
 func measureTCPPing(host string, port string) (time.Duration, bool) {
 	address := net.JoinHostPort(host, port)
 	start := time.Now()
-	
+
 	d := net.Dialer{Timeout: pingTimeout}
 	conn, err := d.Dial("tcp", address)
 	if err != nil {
@@ -375,7 +393,6 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	// Закрываем listener непосредственно перед запуском sing-box для минимизации риска race condition
 	_ = listener.Close()
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
@@ -831,7 +848,6 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
 	content = strings.TrimSpace(content)
 
-	// Разбор Base64 по строкам вместо декодирования всего файла целиком
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, 10*1024*1024)
@@ -847,7 +863,6 @@ func decodeSubscriptionContent(content string, out chan<- string) {
 			continue
 		}
 
-		// Если строка является цельным Base64 блоком
 		cleaned := cleanBase64Fast(line)
 		if len(cleaned) >= 16 {
 			if decoded, err := decodeBase64Flex(cleaned); err == nil && len(decoded) > 0 {
