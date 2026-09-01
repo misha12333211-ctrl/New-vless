@@ -2,8 +2,8 @@ name: Aggregate Subscriptions
 
 on:
   schedule:
-    - cron: '0 */7 * * *' 
-  workflow_dispatch: # Возможность запустить вручную одной кнопкой
+    - cron: '0 */6 * * *' # Обновление каждые 6 часов
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
@@ -16,30 +16,29 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+          cache: true
 
-      - name: Initialize Go Module (if not exists)
+      - name: Build Aggregator Binary
         run: |
           if [ ! -f go.mod ]; then go mod init sub-aggregator; fi
+          go build -o aggregator main.go
 
       - name: Run Aggregator
-        run: go run main.go
+        run: ./aggregator
 
       - name: Deploy to Public Repo
         env:
           PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
-          PUBLIC_REPO: "misha12333211-ctrl/v2ray-aggregator-for-russia" # Укажите ваш публичный репозиторий
+          PUBLIC_REPO: "misha12333211-ctrl/v2ray-aggregator-for-russia"
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Клонируем публичный репозиторий
           git clone https://x-access-token:${PUBLIC_TOKEN}@github.com/${PUBLIC_REPO}.git public_dist
           
-          # Копируем готовые файлы
           cp output_raw.txt public_dist/sub.txt
           cp output_base64.txt public_dist/sub_base64.txt
           
-          # Коммитим и пушим изменения
           cd public_dist
           git add sub.txt sub_base64.txt
           if git diff --staged --quiet; then
