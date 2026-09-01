@@ -28,12 +28,12 @@ import (
 )
 
 const (
-	maxConcurrency     = 32  // Оптимальный параллелизм для GitHub Actions (2 vCPU)
-	maxOutputLimit     = 300 // Лимит конфигов в итоговой подписке
+	maxConcurrency     = 32
+	maxOutputLimit     = 300
 	pingTimeout        = 1200 * time.Millisecond
 	serviceTimeout     = 6000 * time.Millisecond
 	fetchConcurrency   = 15
-	maxGeoCacheEntries = 20000
+	maxGeoCacheEntries = 10000
 )
 
 type ConfigResult struct {
@@ -111,10 +111,16 @@ var nearRUCountries = map[string]bool{
 	"UZ": true, "AZ": true, "KG": true, "TJ": true, "TR": true, "AT": true,
 }
 
+type SimpleGeoCache struct {
+	mu    sync.RWMutex
+	items map[string]string
+}
+
 var (
-	geoCache     sync.Map
-	geoCacheSize int64
-	dnsResolver  = &net.Resolver{
+	geoCache = &SimpleGeoCache{
+		items: make(map[string]string),
+	}
+	dnsResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 1500 * time.Millisecond}
@@ -127,29 +133,51 @@ var (
 	}
 )
 
+func (c *SimpleGeoCache) Get(key string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	val, ok := c.items[key]
+	return val, ok
+}
+
+func (c *SimpleGeoCache) Set(key, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.items) >= maxGeoCacheEntries {
+		for k := range c.items {
+			delete(c.items, k)
+			if len(c.items) <= maxGeoCacheEntries/2 {
+				break
+			}
+		}
+	}
+	c.items[key] = value
+}
+
 func main() {
 	startTime := time.Now()
 
 	fmt.Println("=== [1/5] Инициализация среды и ядра sing-box ===")
-	ensureCoreAvailable()
+	if err := ensureCoreAvailable(); err != nil {
+		fmt.Printf("Ошибка подготовки sing-box core: %v\n", err)
+	}
 
 	sources, err := readLines("sources.txt")
 	if err != nil || len(sources) == 0 {
 		fmt.Printf("Внимание: sources.txt не найден или пуст: %v. Создаем пустые выходы.\n", err)
-		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
-		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
+		_ = safeWriteFile("output_raw.txt", []byte(""))
+		_ = safeWriteFile("output_base64.txt", []byte(""))
 		return
 	}
 	fmt.Printf("Успешно загружено источников: %d\n", len(sources))
 
 	fmt.Println("=== [2/5] Сбор, фильтрация и Base64 декодирование ===")
-	rawConfigs := make(chan string, 200000)
-	var wg sync.WaitGroup
+	rawConfigs := make(chan string, 10000)
 
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          500,
-		MaxIdleConnsPerHost:   50,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       30 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		DisableKeepAlives:     false,
@@ -160,6 +188,7 @@ func main() {
 		Transport: tr,
 	}
 
+	var fetchWg sync.WaitGroup
 	fetchSem := make(chan struct{}, fetchConcurrency)
 
 	for _, src := range sources {
@@ -167,18 +196,20 @@ func main() {
 		if src == "" || strings.HasPrefix(src, "#") || strings.HasPrefix(src, "//") {
 			continue
 		}
-		wg.Add(1)
+		fetchWg.Add(1)
 		go func(targetURL string) {
-			defer wg.Done()
+			defer fetchWg.Done()
 			fetchSem <- struct{}{}
 			defer func() { <-fetchSem }()
 			fetchSubscriptionWithClient(sharedHTTPClient, targetURL, rawConfigs)
 		}(src)
 	}
 
-	wg.Wait()
-	close(rawConfigs)
-	tr.CloseIdleConnections()
+	go func() {
+		fetchWg.Wait()
+		close(rawConfigs)
+		tr.CloseIdleConnections()
+	}()
 
 	uniqueConfigs := make(map[string]bool)
 	for cfg := range rawConfigs {
@@ -193,33 +224,37 @@ func main() {
 
 	if totalConfigs == 0 {
 		fmt.Println("Нет валидных конфигураций для тестирования. Завершение работы.")
-		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
-		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
+		_ = safeWriteFile("output_raw.txt", []byte(""))
+		_ = safeWriteFile("output_base64.txt", []byte(""))
 		return
 	}
 
 	fmt.Println("=== [3/5] Оптимизированный аудит ТСПУ + Высокоскоростное тестирование ===")
+
+	configChan := make(chan string, totalConfigs)
+	for cfg := range uniqueConfigs {
+		configChan <- cfg
+	}
+	close(configChan)
+
 	resultsChan := make(chan ConfigResult, totalConfigs)
-	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
 	var processedCount int64
 
-	for cfg := range uniqueConfigs {
+	for i := 0; i < maxConcurrency; i++ {
 		testWg.Add(1)
-		go func(c string) {
+		go func() {
 			defer testWg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			if res, ok := testConfig(c); ok {
-				resultsChan <- res
+			for cfg := range configChan {
+				if res, ok := testConfig(cfg); ok {
+					resultsChan <- res
+				}
+				curr := atomic.AddInt64(&processedCount, 1)
+				if curr%200 == 0 || curr == int64(totalConfigs) {
+					fmt.Printf("Обработано конфигураций: %d / %d\r", curr, totalConfigs)
+				}
 			}
-
-			curr := atomic.AddInt64(&processedCount, 1)
-			if curr%200 == 0 || curr == int64(totalConfigs) {
-				fmt.Printf("Обработано конфигураций: %d / %d\r", curr, totalConfigs)
-			}
-		}(cfg)
+		}()
 	}
 
 	testWg.Wait()
@@ -270,11 +305,9 @@ func main() {
 
 	fmt.Println("=== [5/5] Запись результативных файлов ===")
 
-	// Время обновления в MSK (UTC+3)
 	mskLoc := time.FixedZone("MSK", 3*3600)
 	updateTimeStr := time.Now().In(mskLoc).Format("2006-01-02 15:04:05")
 
-	// Формирование полного служебного хедера подписки
 	subscriptionHeader := fmt.Sprintf("//profile-title: MIGITI Subscriptions\n"+
 		"//profile-update-interval: 1\n"+
 		"//subscription-userinfo: upload=0; download=0; total=1073741824000; expire=0\n"+
@@ -288,12 +321,24 @@ func main() {
 		serverCount, updateTimeStr)
 
 	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
-	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
+	if err := safeWriteFile("output_raw.txt", []byte(rawOutput)); err != nil {
+		fmt.Printf("Ошибка записи output_raw.txt: %v\n", err)
+	}
 
 	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
-	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
+	if err := safeWriteFile("output_base64.txt", []byte(b64Output)); err != nil {
+		fmt.Printf("Ошибка записи output_base64.txt: %v\n", err)
+	}
 
 	fmt.Printf("Задание успешно выполнено за %v!\n", time.Since(startTime))
+}
+
+func safeWriteFile(filename string, data []byte) error {
+	tmpFile := filename + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpFile, filename)
 }
 
 func testConfig(configStr string) (ConfigResult, bool) {
@@ -374,26 +419,16 @@ func measureTCPPing(host string, port string) (time.Duration, bool) {
 	return time.Since(start), true
 }
 
-func getFreePort() (int, net.Listener, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, nil, err
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	return port, l, nil
-}
-
 func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	corePath := findCoreExecutable()
 	if corePath == "" {
 		return 0, false
 	}
 
-	socksPort, listener, err := getFreePort()
+	socksPort, err := getFreePortNumber()
 	if err != nil {
 		return 0, false
 	}
-	_ = listener.Close()
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
 	if err != nil {
@@ -491,6 +526,16 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	wg.Wait()
 	totalSuccess := int(atomic.LoadInt64(&successCount))
 	return totalSuccess, totalSuccess > 0
+}
+
+func getFreePortNumber() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port, nil
 }
 
 func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
@@ -702,9 +747,9 @@ func findCoreExecutable() string {
 	return ""
 }
 
-func ensureCoreAvailable() {
+func ensureCoreAvailable() error {
 	if findCoreExecutable() != "" {
-		return
+		return nil
 	}
 
 	fmt.Println("Автоматическая установка sing-box Core...")
@@ -723,16 +768,16 @@ func ensureCoreAvailable() {
 	}
 
 	if downloadURL == "" {
-		return
+		return fmt.Errorf("unsupported OS/arch: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Get(downloadURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
-		return
+		return fmt.Errorf("download failed: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -742,51 +787,62 @@ func ensureCoreAvailable() {
 		targetExe = "sing-box.exe"
 	}
 
+	outPath := filepath.Join(cwd, targetExe)
+
 	if strings.HasSuffix(downloadURL, ".zip") {
 		tmpZip, err := os.CreateTemp("", "sb_download_*.zip")
 		if err != nil {
-			return
+			return err
 		}
 		defer os.Remove(tmpZip.Name())
 
-		_, err = io.Copy(tmpZip, resp.Body)
-		_ = tmpZip.Close()
-		if err != nil {
-			return
+		if _, err := io.Copy(tmpZip, resp.Body); err != nil {
+			_ = tmpZip.Close()
+			return err
 		}
+		_ = tmpZip.Close()
 
 		r, err := zip.OpenReader(tmpZip.Name())
 		if err != nil {
-			return
+			return err
 		}
 		defer r.Close()
 
 		for _, f := range r.File {
-			if filepath.Base(f.Name) == targetExe {
+			cleanName := filepath.Base(filepath.Clean(f.Name))
+			if cleanName == targetExe {
 				rc, err := f.Open()
 				if err != nil {
-					return
+					return err
 				}
-				outPath := filepath.Join(cwd, targetExe)
-				outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+
+				tmpOut, err := os.CreateTemp(cwd, "singbox_tmp_*")
 				if err != nil {
 					_ = rc.Close()
-					return
+					return err
 				}
-				_, err = io.Copy(outFile, rc)
+
+				_, err = io.Copy(tmpOut, rc)
 				_ = rc.Close()
-				_ = outFile.Close()
-				if err == nil {
-					_ = os.Chmod(outPath, 0755)
-					fmt.Printf("sing-box Core успешно развернут: (%s)\n", outPath)
+				_ = tmpOut.Close()
+				if err != nil {
+					_ = os.Remove(tmpOut.Name())
+					return err
 				}
-				break
+
+				_ = os.Chmod(tmpOut.Name(), 0755)
+				if err := os.Rename(tmpOut.Name(), outPath); err != nil {
+					_ = os.Remove(tmpOut.Name())
+					return err
+				}
+				fmt.Printf("sing-box Core успешно развернут: (%s)\n", outPath)
+				return nil
 			}
 		}
 	} else if strings.HasSuffix(downloadURL, ".tar.gz") {
 		gzr, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return
+			return err
 		}
 		defer gzr.Close()
 
@@ -797,24 +853,33 @@ func ensureCoreAvailable() {
 				break
 			}
 			if err != nil {
-				return
+				return err
 			}
-			if filepath.Base(header.Name) == targetExe {
-				outPath := filepath.Join(cwd, targetExe)
-				outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+			cleanName := filepath.Base(filepath.Clean(header.Name))
+			if cleanName == targetExe {
+				tmpOut, err := os.CreateTemp(cwd, "singbox_tmp_*")
 				if err != nil {
-					return
+					return err
 				}
-				_, err = io.Copy(outFile, tr)
-				_ = outFile.Close()
-				if err == nil {
-					_ = os.Chmod(outPath, 0755)
-					fmt.Printf("sing-box Core успешно развернут: (%s)\n", outPath)
+
+				if _, err := io.Copy(tmpOut, tr); err != nil {
+					_ = tmpOut.Close()
+					_ = os.Remove(tmpOut.Name())
+					return err
 				}
-				break
+				_ = tmpOut.Close()
+
+				_ = os.Chmod(tmpOut.Name(), 0755)
+				if err := os.Rename(tmpOut.Name(), outPath); err != nil {
+					_ = os.Remove(tmpOut.Name())
+					return err
+				}
+				fmt.Printf("sing-box Core успешно развернут: (%s)\n", outPath)
+				return nil
 			}
 		}
 	}
+	return fmt.Errorf("core binary not found in downloaded archive")
 }
 
 func fetchSubscriptionWithClient(client *http.Client, targetURL string, out chan<- string) {
@@ -938,12 +1003,8 @@ func getIPCountryCode(host string) string {
 		ipStr = ips[0]
 	}
 
-	if val, ok := geoCache.Load(ipStr); ok {
-		return val.(string)
-	}
-
-	if atomic.LoadInt64(&geoCacheSize) > maxGeoCacheEntries {
-		return ""
+	if val, ok := geoCache.Get(ipStr); ok {
+		return val
 	}
 
 	client := &http.Client{Timeout: 800 * time.Millisecond}
@@ -957,8 +1018,7 @@ func getIPCountryCode(host string) string {
 		CountryCode string `json:"countryCode"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.CountryCode != "" {
-		geoCache.Store(ipStr, res.CountryCode)
-		atomic.AddInt64(&geoCacheSize, 1)
+		geoCache.Set(ipStr, res.CountryCode)
 		return res.CountryCode
 	}
 	return ""
