@@ -1,6 +1,7 @@
 package main
 
 import (
+    "compress/gzip"
 	"archive/tar"
 	"archive/zip"
 	"bufio"
