@@ -1,348 +1,53 @@
-package main
+name: Aggregate Subscriptions
 
-import (
-	"archive/tar"
-	"archive/zip"
-	"bufio"
-	"bytes"
-	"context"
-	"crypto/tls"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
-	"time"
-)
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Обновление каждые 6 часов
+  workflow_dispatch:
 
-const (
-	maxConcurrency     = 32  // Оптимальный параллелизм для GitHub Actions (2 vCPU)
-	maxOutputLimit     = 300 // Лимит конфигов в итоговой подписке
-	pingTimeout        = 1200 * time.Millisecond
-	serviceTimeout     = 6000 * time.Millisecond
-	fetchConcurrency   = 15
-	maxGeoCacheEntries = 20000
-)
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout private repo
+        uses: actions/checkout@v4
 
-type ConfigResult struct {
-	URL            string
-	Latency        time.Duration
-	AdjustedPing   time.Duration
-	Score          int
-	ServiceSuccess int
-	SNI            string
-	Protocol       string
-	CountryCode    string
-	IsNearRU       bool
-	IsRuSNI        bool
-	HasBypassTech  bool
-}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
 
-type TargetService struct {
-	Name           string
-	URL            string
-	ExpectedStatus func(code int) bool
-}
+      - name: Build Aggregator Binary
+        run: |
+          if [ ! -f go.mod ]; then go mod init sub-aggregator; fi
+          go build -o aggregator main.go
 
-var targetServices = []TargetService{
-	{
-		Name:           "Google",
-		URL:            "https://www.google.com/generate_204",
-		ExpectedStatus: func(c int) bool { return c == 204 || c == 200 },
-	},
-	{
-		Name:           "Telegram",
-		URL:            "https://t.me",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 302 },
-	},
-	{
-		Name:           "GitHub",
-		URL:            "https://github.com",
-		ExpectedStatus: func(c int) bool { return c == 200 },
-	},
-	{
-		Name:           "YouTube",
-		URL:            "https://www.youtube.com",
-		ExpectedStatus: func(c int) bool { return c == 200 },
-	},
-	{
-		Name:           "Instagram",
-		URL:            "https://www.instagram.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 301 || c == 302 },
-	},
-	{
-		Name:           "WhatsApp",
-		URL:            "https://web.whatsapp.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 302 },
-	},
-	{
-		Name:           "ChatGPT",
-		URL:            "https://chatgpt.com",
-		ExpectedStatus: func(c int) bool { return c == 200 || c == 307 || c == 403 },
-	},
-}
+      - name: Run Aggregator
+        run: ./aggregator
 
-var ruWhiteSNIs = []string{
-	"ya.ru", "yandex.ru", "yandex.com", "api-maps.yandex.ru", "avatars.mds.yandex.net",
-	"browser.yandex.ru", "dzen.ru", "kinopoisk.ru", "hd.kinopoisk.ru", "st.kinopoisk.ru",
-	"mail.yandex.ru", "mc.yandex.ru", "strm.yandex.ru", "travel.yandex.ru",
-	"vk.com", "vk.ru", "m.vk.com", "api.vk.ru", "id.vk.ru", "userapi.com",
-	"mail.ru", "e.mail.ru", "cloud.mail.ru", "avito.ru", "ozon.ru", "wb.ru", "wildberries.ru",
-	"sberbank.ru", "tbank.ru", "alfabank.ru", "vtb.ru", "gosuslugi.ru", "mos.ru",
-	"2gis.ru", "rutube.ru", "rambler.ru", "rbc.ru", "mts.ru", "megafon.ru", "beeline.ru",
-}
-
-var nearRUCountries = map[string]bool{
-	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
-	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
-	"PL": true, "DE": true, "NL": true, "MD": true, "UA": true,
-	"UZ": true, "AZ": true, "KG": true, "TJ": true, "TR": true, "AT": true,
-}
-
-var (
-	geoCache     sync.Map
-	geoCacheSize int64
-	dnsResolver  = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 1500 * time.Millisecond}
-			conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
-			if err != nil {
-				return d.DialContext(ctx, "udp", "1.1.1.1:53")
-			}
-			return conn, nil
-		},
-	}
-)
-
-func main() {
-	startTime := time.Now()
-
-	fmt.Println("=== [1/5] Инициализация среды и ядра sing-box ===")
-	ensureCoreAvailable()
-
-	sources, err := readLines("sources.txt")
-	if err != nil || len(sources) == 0 {
-		fmt.Printf("Внимание: sources.txt не найден или пуст: %v. Создаем пустые выходы.\n", err)
-		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
-		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
-		return
-	}
-	fmt.Printf("Успешно загружено источников: %d\n", len(sources))
-
-	fmt.Println("=== [2/5] Сбор, фильтрация и Base64 декодирование ===")
-	rawConfigs := make(chan string, 200000)
-	var wg sync.WaitGroup
-
-	tr := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          500,
-		MaxIdleConnsPerHost:   50,
-		IdleConnTimeout:       30 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		DisableKeepAlives:     false,
-	}
-
-	sharedHTTPClient := &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: tr,
-	}
-
-	fetchSem := make(chan struct{}, fetchConcurrency)
-
-	for _, src := range sources {
-		src = strings.TrimSpace(src)
-		if src == "" || strings.HasPrefix(src, "#") || strings.HasPrefix(src, "//") {
-			continue
-		}
-		wg.Add(1)
-		go func(targetURL string) {
-			defer wg.Done()
-			fetchSem <- struct{}{}
-			defer func() { <-fetchSem }()
-			fetchSubscriptionWithClient(sharedHTTPClient, targetURL, rawConfigs)
-		}(src)
-	}
-
-	wg.Wait()
-	close(rawConfigs)
-	tr.CloseIdleConnections()
-
-	uniqueConfigs := make(map[string]bool)
-	for cfg := range rawConfigs {
-		cfg = sanitizeProxyURL(cfg)
-		if cfg != "" && len(cfg) < 8192 && isProxyProtocol(cfg) {
-			uniqueConfigs[cfg] = true
-		}
-	}
-
-	totalConfigs := len(uniqueConfigs)
-	fmt.Printf("Валидных уникальных прокси-ссылок в базе: %d\n", totalConfigs)
-
-	if totalConfigs == 0 {
-		fmt.Println("Нет валидных конфигураций для тестирования. Завершение работы.")
-		_ = os.WriteFile("output_raw.txt", []byte(""), 0644)
-		_ = os.WriteFile("output_base64.txt", []byte(""), 0644)
-		return
-	}
-
-	fmt.Println("=== [3/5] Оптимизированный аудит ТСПУ + Высокоскоростное тестирование ===")
-	resultsChan := make(chan ConfigResult, totalConfigs)
-	semaphore := make(chan struct{}, maxConcurrency)
-	var testWg sync.WaitGroup
-	var processedCount int64
-
-	for cfg := range uniqueConfigs {
-		testWg.Add(1)
-		go func(c string) {
-			defer testWg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			if res, ok := testConfig(c); ok {
-				resultsChan <- res
-			}
-
-			curr := atomic.AddInt64(&processedCount, 1)
-			if curr%200 == 0 || curr == int64(totalConfigs) {
-				fmt.Printf("Обработано конфигураций: %d / %d\r", curr, totalConfigs)
-			}
-		}(cfg)
-	}
-
-	testWg.Wait()
-	close(resultsChan)
-	fmt.Println("\nТестирование полностью завершено.")
-
-	var validResults []ConfigResult
-	protoStats := make(map[string]int)
-
-	for res := range resultsChan {
-		if res.Score > 0 && res.ServiceSuccess >= 1 {
-			validResults = append(validResults, res)
-			protoStats[res.Protocol]++
-		}
-	}
-
-	fmt.Printf("=== [4/5] Ранжирование и оптимизация под РФ (Прошло: %d) ===\n", len(validResults))
-	for proto, count := range protoStats {
-		fmt.Printf("  • %s: %d шт.\n", strings.ToUpper(proto), count)
-	}
-
-	sort.Slice(validResults, func(i, j int) bool {
-		if validResults[i].ServiceSuccess == validResults[j].ServiceSuccess {
-			if validResults[i].Score == validResults[j].Score {
-				return validResults[i].AdjustedPing < validResults[j].AdjustedPing
-			}
-			return validResults[i].Score > validResults[j].Score
-		}
-		return validResults[i].ServiceSuccess > validResults[j].ServiceSuccess
-	})
-
-	var selected []ConfigResult
-	usedMap := make(map[string]bool)
-
-	for _, res := range validResults {
-		if len(selected) >= maxOutputLimit {
-			break
-		}
-		if !usedMap[res.URL] {
-			selected = append(selected, res)
-			usedMap[res.URL] = true
-		}
-	}
-
-	var finalSlice []string
-	for i, r := range selected {
-		displayName := fmt.Sprintf("MiGiTi #%d | TG: MiGiTi_official_channel", i+1)
-		renamedURL := setConfigNameUniversal(r.URL, displayName)
-		finalSlice = append(finalSlice, renamedURL)
-	}
-
-	serverCount := len(finalSlice)
-	fmt.Printf("Сформировано конфигов в итоговой подписке: %d шт.\n", serverCount)
-
-	fmt.Println("=== [5/5] Запись результативных файлов ===")
-
-	// Время обновления в MSK (UTC+3)
-	mskLoc := time.FixedZone("MSK", 3*3600)
-	updateTimeStr := time.Now().In(mskLoc).Format("2006-01-02 15:04:05")
-
-	// Формирование полного служебного хедера подписки
-	subscriptionHeader := fmt.Sprintf("//profile-title: MIGITI Subscriptions\n"+
-		"//profile-update-interval: 1\n"+
-		"//subscription-userinfo: upload=0; download=0; total=1073741824000; expire=0\n"+
-		"//total-nodes: %d\n"+
-		"//updated-at: %s MSK\n"+
-		"//channel: https://t.me/MiGiTi_official_channel\n"+
-		"//chat: https://t.me/MiGiTi_official_chat\n"+
-		"//forum: https://t.me/MiGiTi_FORUM\n"+
-		"//site: https://misha12333211-ctrl.github.io/MiGiTi/\n"+
-		"//profile-web-page-url: https://github.com/misha12333211-ctrl/proxy-subs\n\n",
-		serverCount, updateTimeStr)
-
-	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
-	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
-
-	b64Output := base64.StdEncoding.EncodeToString([]byte(rawOutput))
-	_ = os.WriteFile("output_base64.txt", []byte(b64Output), 0644)
-
-	fmt.Printf("Задание успешно выполнено за %v!\n", time.Since(startTime))
-}
-
-func testConfig(configStr string) (ConfigResult, bool) {
-	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
-	if host == "" || port == "" {
-		return ConfigResult{}, false
-	}
-
-	ruSNI := isRuSNI(sni)
-	hasBypassTech := security == "reality" || proto == "hysteria2" || proto == "hy2" || proto == "tuic" || flow != "" || strings.Contains(configStr, "fp=")
-
-	if !passTSPUBypassFilter(proto, port, sni, security, configStr) {
-		return ConfigResult{}, false
-	}
-
-	realPing, ok := measureTCPPing(host, port)
-	if !ok || realPing > pingTimeout {
-		return ConfigResult{}, false
-	}
-
-	passedServices, ok := checkTargetServicesViaProxy(configStr)
-	if !ok || passedServices < 1 {
-		return ConfigResult{}, false
-	}
-
-	countryCode := getIPCountryCode(host)
-	isNearRU := nearRUCountries[countryCode]
-
-	adjustedPing := realPing
-	if countryCode == "RU" {
-		adjustedPing = time.Duration(float64(realPing) * 0.20)
-	} else if isNearRU {
-		adjustedPing = time.Duration(float64(realPing) * 0.50)
-	}
-
-	score := calculateBypassScore(configStr, port, sni, transport, adjustedPing, passedServices, isNearRU, countryCode, ruSNI, hasBypassTech)
-
-	return ConfigResult{
-		URL:            configStr,
-		Latency:        realPing,
-		AdjustedPing:   adjustedPing,
-		Score:          score,
-		ServiceSuccess: passedServices,
+      - name: Deploy to Public Repo
+        env:
+          PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+          PUBLIC_REPO: "misha12333211-ctrl/v2ray-aggregator-for-russia"
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git clone https://x-access-token:${PUBLIC_TOKEN}@github.com/${PUBLIC_REPO}.git public_dist
+          
+          cp output_raw.txt public_dist/sub.txt
+          cp output_base64.txt public_dist/sub_base64.txt
+          
+          cd public_dist
+          git add sub.txt sub_base64.txt
+          if git diff --staged --quiet; then
+            echo "Изменений нет, пропуск пуша."
+          else
+            git commit -m "Auto-update subscriptions: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
+erviceSuccess: passedServices,
 		SNI:            sni,
 		Protocol:       proto,
 		CountryCode:    countryCode,
