@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	maxConcurrency     = 128 // Безопасно для GitHub Actions Runner (ускорение в 8 раз)
+	maxConcurrency     = 128 // Безопасно для GitHub Actions Runner
 	maxOutputLimit     = 300 // Лимит конфигов в итоговой подписке
 	pingTimeout        = 800 * time.Millisecond
 	serviceTimeout     = 3500 * time.Millisecond
@@ -233,7 +233,6 @@ func main() {
 
 	fmt.Printf("=== [4/5] GeoIP Обогащение и ранжирование под РФ (Прошло тест: %d) ===\n", len(rawValidResults))
 
-	// Параллельное обогащение GeoIP только для прошедших прокси
 	validResults := enrichWithGeoIPParallel(rawValidResults)
 	protoStats := make(map[string]int)
 
@@ -317,7 +316,8 @@ func main() {
 }
 
 func testConfigFast(configStr string) (ConfigResult, bool) {
-	host, port, sni, _, transport, proto, security, flow := parseConfigDetails(configStr)
+	// Исправлено: заменена неиспользуемая переменная transport на _
+	host, port, sni, _, _, proto, security, flow := parseConfigDetails(configStr)
 	if host == "" || port == "" {
 		return ConfigResult{}, false
 	}
@@ -353,7 +353,7 @@ func testConfigFast(configStr string) (ConfigResult, bool) {
 
 func enrichWithGeoIPParallel(results []ConfigResult) []ConfigResult {
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 30) // Ограничиваем GeoIP запросы, чтобы не получить баны
+	sem := make(chan struct{}, 30)
 	enriched := make([]ConfigResult, len(results))
 
 	for i, res := range results {
