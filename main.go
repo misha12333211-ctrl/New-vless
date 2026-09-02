@@ -100,14 +100,14 @@ var ruWhiteSNIs = []string{
 	"2gis.ru", "rutube.ru", "rambler.ru", "rbc.ru", "mts.ru", "megafon.ru", "beeline.ru",
 }
 
-// Расширенная карта почти всех стран и территорий мира
+// Расширенная карта почти всех стран и территорий мира (без дубликатов ключей)
 var nearRUCountries = map[string]bool{
 	// Ближнее окружение и Европа (Приоритет по пингу)
 	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
 	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
 	"PL": true, "DE": true, "NL": true, "MD": true, "UA": true,
 	"UZ": true, "AZ": true, "KG": true, "TJ": true, "TR": true, "AT": true,
-	"FI": true, "NO": true, "DK": true, "GB": true, "IE": true, "FR": true,
+	"NO": true, "DK": true, "GB": true, "IE": true, "FR": true,
 	"ES": true, "PT": true, "IT": true, "CH": true, "BE": true, "LU": true,
 	"CZ": true, "SK": true, "HU": true, "RO": true, "BG": true, "GR": true,
 	"CY": true, "MT": true, "HR": true, "SI": true, "BA": true, "RS": true,
@@ -125,7 +125,7 @@ var nearRUCountries = map[string]bool{
 	"PK": false, "BD": false, "LK": false, "NP": false, "AE": false, "SA": false,
 	"IL": false, "IR": false, "IQ": false, "QA": false, "KW": false, "OM": false,
 	"BH": false, "JO": false, "LB": false, "AU": false, "NZ": false, "KH": false,
-	"MM": false, "LA": false, "MN": false, "GE": true,  "AM": true,  "AZ": true,
+	"MM": false, "LA": false, "MN": false,
 
 	// Африка
 	"ZA": false, "EG": false, "NG": false, "KE": false, "MA": false, "DZ": false,
@@ -307,8 +307,8 @@ func main() {
 			sniTag = " [SNI-RU]"
 		}
 
-		// Формирование имени: БЕЗ провайдера, ТОЛЬКО флаг, страна, метка SNI-RU и порядковый номер
-		displayName := fmt.Sprintf("%s %s%s | MiGiTi #%d", flag, countryStr, sniTag, i+1)
+		// Формирование имени: флаг, страна, SNI-RU, канал TG и порядковый номер
+		displayName := fmt.Sprintf("%s %s%s | TG: MiGiTi_official_channel #%d", flag, countryStr, sniTag, i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
