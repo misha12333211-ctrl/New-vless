@@ -100,9 +100,10 @@ var ruWhiteSNIs = []string{
 	"2gis.ru", "rutube.ru", "rambler.ru", "rbc.ru", "mts.ru", "megafon.ru", "beeline.ru",
 }
 
-// Расширенная карта почти всех стран и территорий мира (без дубликатов ключей)
+// Полноценный реестр стран мира ISO 3166-1 alpha-2.
+// true = Ближнее окружение / Европа (выгодный приоритет для задержки), false = остальные страны.
 var nearRUCountries = map[string]bool{
-	// Ближнее окружение и Европа (Приоритет по пингу)
+	// --- Ближнее окружение, СНГ и Европа (Приоритетная зона) ---
 	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
 	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
 	"PL": true, "DE": true, "NL": true, "MD": true, "UA": true,
@@ -111,26 +112,55 @@ var nearRUCountries = map[string]bool{
 	"ES": true, "PT": true, "IT": true, "CH": true, "BE": true, "LU": true,
 	"CZ": true, "SK": true, "HU": true, "RO": true, "BG": true, "GR": true,
 	"CY": true, "MT": true, "HR": true, "SI": true, "BA": true, "RS": true,
-	"ME": true, "MK": true, "AL": true, "IS": true,
+	"ME": true, "MK": true, "AL": true, "IS": true, "FO": true, "GI": true,
+	"GL": true, "IM": true, "JE": true, "GG": true, "MC": true, "LI": true,
+	"SM": true, "VA": true, "AD": true, "AX": true, "SJ": true,
 
-	// Северная и Южная Америка
-	"US": false, "CA": false, "MX": false, "BR": false, "AR": false, "CL": false,
-	"CO": false, "PE": false, "VE": false, "EC": false, "GT": false, "CU": false,
-	"HT": false, "DO": false, "PA": false, "CR": false, "UY": false, "PY": false,
-	"BO": false, "JM": false, "TT": false, "BB": false, "BZ": false, "GY": false,
+	// --- Северная Америка ---
+	"US": false, "CA": false, "MX": false, "PM": false, "BM": false,
 
-	// Азия и Океания
+	// --- Центральная Америка и Карибы ---
+	"GT": false, "BZ": false, "SV": false, "HN": false, "NI": false, "CR": false,
+	"PA": false, "CU": false, "HT": false, "DO": false, "JM": false, "TT": false,
+	"BB": false, "BS": false, "CW": false, "AW": false, "AG": false, "DM": false,
+	"GD": false, "KN": false, "LC": false, "VC": false, "KY": false, "TC": false,
+	"VG": false, "VI": false, "AI": false, "MS": false, "GP": false, "MQ": false,
+	"SX": false, "BL": false, "MF": false, "BQ": false,
+
+	// --- Южная Америка ---
+	"BR": false, "AR": false, "CL": false, "CO": false, "PE": false, "VE": false,
+	"EC": false, "UY": false, "PY": false, "BO": false, "GY": false, "SR": false,
+	"GF": false, "FK": false,
+
+	// --- Восточная, Южная и Юго-Восточная Азия ---
 	"CN": false, "JP": false, "KR": false, "HK": false, "TW": false, "SG": false,
 	"IN": false, "ID": false, "MY": false, "TH": false, "VN": false, "PH": false,
-	"PK": false, "BD": false, "LK": false, "NP": false, "AE": false, "SA": false,
-	"IL": false, "IR": false, "IQ": false, "QA": false, "KW": false, "OM": false,
-	"BH": false, "JO": false, "LB": false, "AU": false, "NZ": false, "KH": false,
-	"MM": false, "LA": false, "MN": false,
+	"PK": false, "BD": false, "LK": false, "NP": false, "KH": false, "MM": false,
+	"LA": false, "MN": false, "BT": false, "MV": false, "MO": false, "BN": false,
+	"TL": false, "KP": false,
 
-	// Африка
+	// --- Ближний Восток и Центральная Азия ---
+	"AE": false, "SA": false, "IL": false, "IR": false, "IQ": false, "QA": false,
+	"KW": false, "OM": false, "BH": false, "JO": false, "LB": false, "SY": false,
+	"YE": false, "PS": false, "AF": false, "TM": false,
+
+	// --- Африка ---
 	"ZA": false, "EG": false, "NG": false, "KE": false, "MA": false, "DZ": false,
 	"TN": false, "GH": false, "ET": false, "TZ": false, "UG": false, "AO": false,
 	"MZ": false, "ZW": false, "SN": false, "CI": false, "CM": false, "LY": false,
+	"SD": false, "SS": false, "MG": false, "ZM": false, "MW": false, "BW": false,
+	"NA": false, "GA": false, "CG": false, "CD": false, "RW": false, "BI": false,
+	"SL": false, "LR": false, "GN": false, "GM": false, "GW": false, "MR": false,
+	"ML": false, "BF": false, "NE": false, "TD": false, "ER": false, "DJ": false,
+	"SO": false, "GQ": false, "TG": false, "BJ": false, "LS": false, "SZ": false,
+	"KM": false, "MU": false, "SC": false, "CV": false, "ST": false, "YT": false,
+	"RE": false, "SH": false,
+
+	// --- Океания и Австралия ---
+	"AU": false, "NZ": false, "PG": false, "FJ": false, "SB": false, "VU": false,
+	"NC": false, "PF": false, "GU": false, "MP": false, "FM": false, "MH": false,
+	"PW": false, "WS": false, "TO": false, "KI": false, "TV": false, "NR": false,
+	"CK": false, "NU": false, "TK": false, "WF": false, "AS": false,
 }
 
 var (
@@ -398,7 +428,12 @@ func enrichWithGeoIPParallel(results []ConfigResult) []ConfigResult {
 			defer func() { <-sem }()
 
 			geoInfo := getGeoInfo(r.Host)
-			isNearRU := nearRUCountries[geoInfo.CountryCode]
+			
+			// Безопасное определение локации с фоллбеком на false для любых незнакомых кодов
+			isNearRU, exists := nearRUCountries[geoInfo.CountryCode]
+			if !exists {
+				isNearRU = false
+			}
 
 			adjustedPing := r.Latency
 			if geoInfo.CountryCode == "RU" {
@@ -1099,7 +1134,7 @@ func getGeoInfo(host string) GeoInfo {
 
 		info := GeoInfo{
 			IP:          ipStr,
-			CountryCode: res.CountryCode,
+			CountryCode: strings.ToUpper(strings.TrimSpace(res.CountryCode)),
 			ISP:         ispName,
 		}
 
