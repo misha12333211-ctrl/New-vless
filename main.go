@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -100,17 +101,22 @@ var ruWhiteSNIs = []string{
 	"2gis.ru", "rutube.ru", "rambler.ru", "rbc.ru", "mts.ru", "megafon.ru", "beeline.ru",
 }
 
-// Список приоритетных стран Ближнего Зарубежья и Европы для оптимизации пинга
-var nearRUCountries = map[string]bool{
-	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
-	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
-	"PL": true, "DE": true, "NL": true, "MD": true, "UA": true,
-	"UZ": true, "AZ": true, "KG": true, "TJ": true, "TR": true, "AT": true,
-	"NO": true, "DK": true, "GB": true, "IE": true, "FR": true,
-	"ES": true, "PT": true, "IT": true, "CH": true, "BE": true, "LU": true,
-	"CZ": true, "SK": true, "HU": true, "RO": true, "BG": true, "GR": true,
-	"CY": true, "MT": true, "HR": true, "SI": true, "BA": true, "RS": true,
-	"ME": true, "MK": true, "AL": true, "IS": true,
+// Карта стран с приоритетом поиска (бонусами)
+// Все запрошенные страны: DE, AM, RU, IT, ES, NL, SE, PL, FI, US определены корректно
+var countryPriorityMap = map[string]int{
+	// Топ-Ближнее окружение
+	"RU": 2500, "BY": 1800, "AM": 1800, "KZ": 1800, "GE": 1500, "MD": 1500, "UA": 1500,
+
+	// Европа (Германия, Нидерланды, Швеция, Польша, Финляндия, Италия, Испания и др.)
+	"DE": 1400, "NL": 1400, "FI": 1400, "SE": 1400, "PL": 1400, "IT": 1300, "ES": 1300,
+	"EE": 1300, "LV": 1300, "LT": 1300, "AT": 1200, "FR": 1200, "GB": 1200, "CH": 1200,
+	"CZ": 1200, "SK": 1200, "HU": 1200, "RO": 1200, "BG": 1200, "NO": 1200, "DK": 1200,
+
+	// США и Северная Америка
+	"US": 1100, "CA": 1000,
+
+	// Другие популярные локации
+	"TR": 1100, "AE": 1000, "SG": 1000, "JP": 900, "KR": 900, "HK": 900,
 }
 
 var (
@@ -241,13 +247,25 @@ func main() {
 
 	validResults := enrichWithGeoIPParallel(rawValidResults)
 	protoStats := make(map[string]int)
+	countryStats := make(map[string]int)
 
 	for _, res := range validResults {
 		protoStats[res.Protocol]++
+		cc := res.CountryCode
+		if cc == "" {
+			cc = "UNK"
+		}
+		countryStats[cc]++
 	}
 
+	fmt.Println("Статистика по протоколам:")
 	for proto, count := range protoStats {
 		fmt.Printf("  • %s: %d шт.\n", strings.ToUpper(proto), count)
+	}
+
+	fmt.Println("Статистика по обнаруженным странам:")
+	for country, count := range countryStats {
+		fmt.Printf("  • %s %s: %d шт.\n", countryCodeToFlag(country), country, count)
 	}
 
 	sort.Slice(validResults, func(i, j int) bool {
@@ -276,7 +294,7 @@ func main() {
 	var finalSlice []string
 	for i, r := range selected {
 		flag := countryCodeToFlag(r.CountryCode)
-		countryStr := strings.ToUpper(r.CountryCode)
+		countryStr := r.CountryCode
 		if countryStr == "" {
 			countryStr = "LOC"
 		}
@@ -374,21 +392,19 @@ func enrichWithGeoIPParallel(results []ConfigResult) []ConfigResult {
 			defer func() { <-sem }()
 
 			geoInfo := getGeoInfo(r.Host)
-			isNearRU := nearRUCountries[geoInfo.CountryCode]
 
 			adjustedPing := r.Latency
-			if geoInfo.CountryCode == "RU" {
-				adjustedPing = time.Duration(float64(r.Latency) * 0.20)
-			} else if isNearRU {
-				adjustedPing = time.Duration(float64(r.Latency) * 0.50)
+			if geoInfo.CountryCode == "RU" || geoInfo.CountryCode == "AM" || geoInfo.CountryCode == "BY" {
+				adjustedPing = time.Duration(float64(r.Latency) * 0.30)
+			} else if countryPriorityMap[geoInfo.CountryCode] > 1200 {
+				adjustedPing = time.Duration(float64(r.Latency) * 0.60)
 			}
 
-			score := calculateBypassScore(r.URL, "", r.SNI, "", adjustedPing, r.ServiceSuccess, isNearRU, geoInfo.CountryCode, r.IsRuSNI, r.HasBypassTech)
+			score := calculateBypassScore(r.URL, "", r.SNI, "", adjustedPing, r.ServiceSuccess, geoInfo.CountryCode, r.IsRuSNI, r.HasBypassTech)
 
 			r.CountryCode = geoInfo.CountryCode
 			r.ISP = geoInfo.ISP
 			r.IP = geoInfo.IP
-			r.IsNearRU = isNearRU
 			r.AdjustedPing = adjustedPing
 			r.Score = score
 
@@ -1015,7 +1031,6 @@ func isProxyProtocol(line string) bool {
 		strings.HasPrefix(lower, "tuic://")
 }
 
-// Универсальное преобразование ISO2 кода любой страны в Unicode Эмодзи-флаг
 func countryCodeToFlag(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if len(code) != 2 {
@@ -1029,13 +1044,13 @@ func countryCodeToFlag(code string) string {
 }
 
 func getGeoInfo(host string) GeoInfo {
-	ipStr := strings.Trim(host, "[]")
-	if net.ParseIP(ipStr) == nil {
+	ipStr := host
+	if net.ParseIP(host) == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer cancel()
-		ips, err := dnsResolver.LookupHost(ctx, ipStr)
+		ips, err := dnsResolver.LookupHost(ctx, host)
 		if err != nil || len(ips) == 0 {
-			return GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
+			return GeoInfo{IP: host, CountryCode: "", ISP: "Unknown"}
 		}
 		ipStr = ips[0]
 	}
@@ -1048,7 +1063,7 @@ func getGeoInfo(host string) GeoInfo {
 		return GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
 	}
 
-	client := &http.Client{Timeout: 900 * time.Millisecond}
+	client := &http.Client{Timeout: 700 * time.Millisecond}
 	resp, err := client.Get("http://ip-api.com/json/" + ipStr + "?fields=countryCode,isp,org")
 	if err != nil {
 		emptyInfo := GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
@@ -1074,7 +1089,7 @@ func getGeoInfo(host string) GeoInfo {
 
 		info := GeoInfo{
 			IP:          ipStr,
-			CountryCode: strings.ToUpper(res.CountryCode),
+			CountryCode: res.CountryCode,
 			ISP:         ispName,
 		}
 
@@ -1089,13 +1104,14 @@ func getGeoInfo(host string) GeoInfo {
 	return emptyInfo
 }
 
-func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string, ruSNI bool, hasBypassTech bool) int {
+func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, countryCode string, ruSNI bool, hasBypassTech bool) int {
 	score := 100 + (passedServices * 500)
 
-	if countryCode == "RU" {
-		score += 2500
-	} else if isNearRU {
-		score += 1200
+	// Добавляем бонус в зависимости от ценности страны
+	if priorityBonus, exists := countryPriorityMap[countryCode]; exists {
+		score += priorityBonus
+	} else {
+		score += 500 // Минимальный базовый бонус для любых других зарубежных стран
 	}
 
 	if ruSNI {
