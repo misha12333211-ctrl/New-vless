@@ -33,9 +33,9 @@ const (
 	maxConcurrency     = 128 // Безопасно для GitHub Actions Runner
 	maxOutputLimit     = 300 // Лимит конфигов в итоговой подписке
 	pingTimeout        = 800 * time.Millisecond
-	serviceTimeout     = 3500 * time.Millisecond
+	serviceTimeout     = 4500 * time.Millisecond
 	fetchConcurrency   = 16
-	maxGeoCacheEntries = 10000
+	maxGeoCacheEntries = 20000
 )
 
 type ConfigResult struct {
@@ -100,11 +100,37 @@ var ruWhiteSNIs = []string{
 	"2gis.ru", "rutube.ru", "rambler.ru", "rbc.ru", "mts.ru", "megafon.ru", "beeline.ru",
 }
 
+// Расширенная карта почти всех стран и территорий мира
 var nearRUCountries = map[string]bool{
+	// Ближнее окружение и Европа (Приоритет по пингу)
 	"RU": true, "BY": true, "KZ": true, "AM": true, "GE": true,
 	"FI": true, "SE": true, "EE": true, "LV": true, "LT": true,
 	"PL": true, "DE": true, "NL": true, "MD": true, "UA": true,
 	"UZ": true, "AZ": true, "KG": true, "TJ": true, "TR": true, "AT": true,
+	"FI": true, "NO": true, "DK": true, "GB": true, "IE": true, "FR": true,
+	"ES": true, "PT": true, "IT": true, "CH": true, "BE": true, "LU": true,
+	"CZ": true, "SK": true, "HU": true, "RO": true, "BG": true, "GR": true,
+	"CY": true, "MT": true, "HR": true, "SI": true, "BA": true, "RS": true,
+	"ME": true, "MK": true, "AL": true, "IS": true,
+
+	// Северная и Южная Америка
+	"US": false, "CA": false, "MX": false, "BR": false, "AR": false, "CL": false,
+	"CO": false, "PE": false, "VE": false, "EC": false, "GT": false, "CU": false,
+	"HT": false, "DO": false, "PA": false, "CR": false, "UY": false, "PY": false,
+	"BO": false, "JM": false, "TT": false, "BB": false, "BZ": false, "GY": false,
+
+	// Азия и Океания
+	"CN": false, "JP": false, "KR": false, "HK": false, "TW": false, "SG": false,
+	"IN": false, "ID": false, "MY": false, "TH": false, "VN": false, "PH": false,
+	"PK": false, "BD": false, "LK": false, "NP": false, "AE": false, "SA": false,
+	"IL": false, "IR": false, "IQ": false, "QA": false, "KW": false, "OM": false,
+	"BH": false, "JO": false, "LB": false, "AU": false, "NZ": false, "KH": false,
+	"MM": false, "LA": false, "MN": false, "GE": true,  "AM": true,  "AZ": true,
+
+	// Африка
+	"ZA": false, "EG": false, "NG": false, "KE": false, "MA": false, "DZ": false,
+	"TN": false, "GH": false, "ET": false, "TZ": false, "UG": false, "AO": false,
+	"MZ": false, "ZW": false, "SN": false, "CI": false, "CM": false, "LY": false,
 }
 
 var (
@@ -196,7 +222,7 @@ func main() {
 
 	debug.FreeOSMemory()
 
-	fmt.Println("=== [3/5] Высокоскоростное тестирование доступности прокси ===")
+	fmt.Println("=== [3/5] Высокоскоростное тестирование доступности и проверка IP через sing-box ===")
 	resultsChan := make(chan ConfigResult, totalConfigs)
 	semaphore := make(chan struct{}, maxConcurrency)
 	var testWg sync.WaitGroup
@@ -275,12 +301,14 @@ func main() {
 			countryStr = "LOC"
 		}
 
-		ispStr := r.ISP
-		if ispStr == "" {
-			ispStr = "Server"
+		// Если используется российский SNI, добавляем метку [SNI-RU]
+		sniTag := ""
+		if r.IsRuSNI {
+			sniTag = " [SNI-RU]"
 		}
 
-		displayName := fmt.Sprintf("%s %s | %s | MiGiTi #%d", flag, countryStr, ispStr, i+1)
+		// Формирование имени: БЕЗ провайдера, ТОЛЬКО флаг, страна, метка SNI-RU и порядковый номер
+		displayName := fmt.Sprintf("%s %s%s | MiGiTi #%d", flag, countryStr, sniTag, i+1)
 		renamedURL := setConfigNameUniversal(r.URL, displayName)
 		finalSlice = append(finalSlice, renamedURL)
 	}
@@ -316,7 +344,6 @@ func main() {
 }
 
 func testConfigFast(configStr string) (ConfigResult, bool) {
-	// Исправлено: заменена неиспользуемая переменная transport на _
 	host, port, sni, _, _, proto, security, flow := parseConfigDetails(configStr)
 	if host == "" || port == "" {
 		return ConfigResult{}, false
@@ -334,9 +361,16 @@ func testConfigFast(configStr string) (ConfigResult, bool) {
 		return ConfigResult{}, false
 	}
 
-	passedServices, ok := checkTargetServicesViaProxy(configStr)
+	// Тестирование целевых сервисов и параллельный замер реального выходного IP через прокси
+	passedServices, realExitIP, ok := checkTargetServicesViaProxy(configStr)
 	if !ok || passedServices < 1 {
 		return ConfigResult{}, false
+	}
+
+	// Если реальный IP определился через выход прокси (2IP style), используем его
+	finalHostIP := host
+	if realExitIP != "" {
+		finalHostIP = realExitIP
 	}
 
 	return ConfigResult{
@@ -344,7 +378,7 @@ func testConfigFast(configStr string) (ConfigResult, bool) {
 		Latency:        realPing,
 		SNI:            sni,
 		Protocol:       proto,
-		Host:           host,
+		Host:           finalHostIP,
 		ServiceSuccess: passedServices,
 		IsRuSNI:        ruSNI,
 		HasBypassTech:  hasBypassTech,
@@ -427,26 +461,26 @@ func getFreePort() (int, net.Listener, error) {
 	return port, l, nil
 }
 
-func checkTargetServicesViaProxy(configStr string) (int, bool) {
+func checkTargetServicesViaProxy(configStr string) (int, string, bool) {
 	corePath := findCoreExecutable()
 	if corePath == "" {
-		return 0, false
+		return 0, "", false
 	}
 
 	socksPort, listener, err := getFreePort()
 	if err != nil {
-		return 0, false
+		return 0, "", false
 	}
 	_ = listener.Close()
 
 	singBoxConfigJSON, err := generateSingBoxConfig(configStr, socksPort)
 	if err != nil {
-		return 0, false
+		return 0, "", false
 	}
 
 	tmpConfigFile, err := os.CreateTemp("", "sb_cfg_*.json")
 	if err != nil {
-		return 0, false
+		return 0, "", false
 	}
 	tmpConfigPath := tmpConfigFile.Name()
 	defer os.Remove(tmpConfigPath)
@@ -464,7 +498,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	}
 
 	if err := cmd.Start(); err != nil {
-		return 0, false
+		return 0, "", false
 	}
 
 	defer func() {
@@ -491,7 +525,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 	}
 
 	if !proxyReady {
-		return 0, false
+		return 0, "", false
 	}
 
 	proxyURL, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", socksPort))
@@ -511,6 +545,36 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	var wg sync.WaitGroup
 	var successCount int64
+	var realExitIP string
+	var ipOnce sync.Once
+
+	// Параллельная проверка реального внешнего IP (2IP style) через поднят прокси
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		reqCtx, reqCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		defer reqCancel()
+
+		req, err := http.NewRequestWithContext(reqCtx, "GET", "https://api.ipify.org?format=json", nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		var ipRes struct {
+			IP string `json:"ip"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&ipRes) == nil && ipRes.IP != "" {
+			ipOnce.Do(func() {
+				realExitIP = strings.TrimSpace(ipRes.IP)
+			})
+		}
+	}()
 
 	for _, service := range targetServices {
 		wg.Add(1)
@@ -540,7 +604,7 @@ func checkTargetServicesViaProxy(configStr string) (int, bool) {
 
 	wg.Wait()
 	totalSuccess := int(atomic.LoadInt64(&successCount))
-	return totalSuccess, totalSuccess > 0
+	return totalSuccess, realExitIP, totalSuccess > 0
 }
 
 func generateSingBoxConfig(configURL string, socksPort int) ([]byte, error) {
@@ -976,6 +1040,7 @@ func isProxyProtocol(line string) bool {
 		strings.HasPrefix(lower, "tuic://")
 }
 
+// Преобразование ISO двухбуквенного кода страны в эмодзи флаг
 func countryCodeToFlag(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if len(code) != 2 {
@@ -1032,8 +1097,6 @@ func getGeoInfo(host string) GeoInfo {
 			ispName = "Server"
 		}
 
-		ispName = cleanISPName(ispName)
-
 		info := GeoInfo{
 			IP:          ipStr,
 			CountryCode: res.CountryCode,
@@ -1049,19 +1112,6 @@ func getGeoInfo(host string) GeoInfo {
 	emptyInfo := GeoInfo{IP: ipStr, CountryCode: "", ISP: "Unknown"}
 	geoCache.Store(ipStr, emptyInfo)
 	return emptyInfo
-}
-
-func cleanISPName(name string) string {
-	name = strings.ReplaceAll(name, "|", "")
-	name = strings.ReplaceAll(name, "#", "")
-	words := strings.Fields(name)
-	if len(words) > 0 {
-		if len(words) >= 2 && len(words[0]) <= 3 {
-			return words[0] + " " + words[1]
-		}
-		return words[0]
-	}
-	return "Server"
 }
 
 func calculateBypassScore(configStr string, port string, sni string, transport string, latency time.Duration, passedServices int, isNearRU bool, countryCode string, ruSNI bool, hasBypassTech bool) int {
