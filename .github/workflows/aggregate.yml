@@ -26,24 +26,36 @@ jobs:
       - name: Run Aggregator
         run: ./aggregator
 
-      - name: Deploy to Public Repo
+      - name: Deploy to GitHub and GitVerse
         env:
-          PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
-          PUBLIC_REPO: "misha12333211-ctrl/v2ray-aggregator-for-russia"
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+          GH_REPO: "misha12333211-ctrl/v2ray-aggregator-for-russia"
+          GV_TOKEN: ${{ secrets.GITVERSE_TOKEN }}
+          GV_REPO: "MiGiTi/MiGiTi_Proxy_Subscriptions"
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          git clone https://x-access-token:${PUBLIC_TOKEN}@github.com/${PUBLIC_REPO}.git public_dist
+          # Клонируем публичный репозиторий с GitHub
+          git clone https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git public_dist
           
+          # Копируем свежие файлы
           cp output_raw.txt public_dist/sub.txt
           cp output_base64.txt public_dist/sub_base64.txt
           
           cd public_dist
+          
+          # Добавляем GitVerse в качестве второго remote
+          git remote add gitverse https://oauth2:${GV_TOKEN}@gitverse.ru/${GV_REPO}.git
+          
           git add sub.txt sub_base64.txt
+          
           if git diff --staged --quiet; then
             echo "Изменений нет, пропуск пуша."
           else
             git commit -m "Auto-update subscriptions: $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
+            
+            # Пушим одновременно на GitHub и GitVerse
+            git push origin main
+            git push gitverse main --force
           fi
