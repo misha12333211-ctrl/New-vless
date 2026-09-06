@@ -317,7 +317,7 @@ func main() {
 	mskLoc := time.FixedZone("MSK", 3*3600)
 	updateTimeStr := time.Now().In(mskLoc).Format("2006-01-02 15:04:05")
 
-	subscriptionHeader := fmt.Sprintf("//profile-title: MIGITI Subscriptions\n"+
+		subscriptionHeader := fmt.Sprintf("//profile-title: MIGITI Subscriptions\n"+
 		"//profile-update-interval: 1\n"+
 		"//subscription-userinfo: upload=0; download=0; total=1073741824000; expire=0\n"+
 		"//total-nodes: %d\n"+
@@ -326,8 +326,10 @@ func main() {
 		"//chat: https://t.me/MiGiTi_official_chat\n"+
 		"//forum: https://t.me/MiGiTi_FORUM\n"+
 		"//site: https://misha12333211-ctrl.github.io/MiGiTi/\n"+
-		"//profile-web-page-url: https://github.com/misha12333211-ctrl/proxy-subs\n\n",
+		"//gitverse: https://gitverse.ru/MiGiTi/MiGiTi_Proxy_Subscriptions\n"+
+		"//profile-web-page-url: https://github.com/misha12333211-ctrl/v2ray-aggregator-for-russia\n\n",
 		serverCount, updateTimeStr)
+
 
 	rawOutput := subscriptionHeader + strings.Join(finalSlice, "\n")
 	_ = os.WriteFile("output_raw.txt", []byte(rawOutput), 0644)
